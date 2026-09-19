@@ -1,0 +1,46 @@
+# ---- 构建产物 ----
+build/
+build-*/
+out/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+*.idb
+*.res
+*.tlog
+*.log
+*.lastbuildstate
+
+# ---- CMake 生成物 ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+.vs/
+*.vcxproj
+*.vcxproj.*
+*.sln
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---- 临时诊断程序（_verify 下的 .cpp 保留，编译产物忽略）----
+_verify/*.exe
+_verify/*.obj
+
+# ---- 大文件/临时截图（需要保留的渲染样例会单独提交，见下方白名单）----
+docs/render_*.png
+!docs/render_corners.png
+!docs/render_realtime.png
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini

@@ -1,0 +1,9 @@
+# 统一行尾为 LF：源码含 UTF-8 中文注释，固定行尾可避免不同平台/工具改写字节。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.exe binary
+*.lib binary
+*.obj binary
+*.pdb binary
