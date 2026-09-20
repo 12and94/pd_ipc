@@ -27,6 +27,7 @@ uint64_t mix(uint64_t h, uint64_t v) {
 }  // namespace
 
 SolverStamp computeStamp(const Mesh& mesh, Scalar dt, Scalar damping, uint64_t topologyId) {
+  // damping 参数保留在签名里（调用方语义完整），但它不影响数值戳 —— 见 computeStamp 尾部说明。
   SolverStamp s;
   s.topologyId = topologyId;
   s.dtBits = bitsOf(dt);
@@ -58,7 +59,25 @@ SolverStamp computeStamp(const Mesh& mesh, Scalar dt, Scalar damping, uint64_t t
   return s;
 }
 
-void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
+uint64_t computeStructureStamp(const Mesh& mesh, uint64_t topologyId) {
+  // 顺序敏感：同一个 mesh 每次调用都得到同一个值（edges 与 pinned 都不会在
+  // 帧内被重排），所以可以直接逐项混合。
+  uint64_t h = 0xcbf29ce484222325ULL;
+  h = mix(h, topologyId);
+  h = mix(h, static_cast<uint64_t>(mesh.vertexCount()));
+  h = mix(h, static_cast<uint64_t>(mesh.edgeCount()));
+  for (const auto& e : mesh.edges) {
+    h = mix(h, static_cast<uint64_t>(static_cast<uint32_t>(e.a)));
+    h = mix(h, static_cast<uint64_t>(static_cast<uint32_t>(e.b)));
+  }
+  // pin 掩码：它决定哪些行被覆盖、哪些耦合块被跳过 —— 会改变稀疏结构。
+  for (std::size_t v = 0; v < mesh.pinned.size(); ++v) {
+    h = mix(h, mesh.pinned[v] ? 1ULL : 0ULL);
+  }
+  return h;
+}
+
+void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar /*damping*/,
                           Eigen::SparseMatrix<Scalar>& L) {
   const int n = mesh.vertexCount();
   const int dim = 3 * n;
@@ -120,7 +139,7 @@ void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
 }
 
 void assembleInertialRhs(const Mesh& mesh, const std::vector<Vec3>& predicted, Scalar dt,
-                         Scalar damping, Eigen::VectorXd& b) {
+                         Scalar /*damping*/, Eigen::VectorXd& b) {
   const int n = mesh.vertexCount();
   // damping 参数同样不在这里使用：有效质量不做任何缩放，惯性项就是 M/h²
   // （阻尼由 Integrator 的速度更新承担，见上）。

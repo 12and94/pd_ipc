@@ -57,6 +57,7 @@ struct SimContext {
   uint64_t topologyId = 1;      ///< 拓扑变更时自增
   SolverStamp stamp;            ///< 上次分解时的判定戳
   bool stampValid = false;      ///< 是否已经分解过至少一次
+  uint64_t structureStamp = 0;  ///< 上次符号分解时的**稀疏结构**戳（见 Assembler.h）
 
   int factorizeCount = 0;       ///< 实际发生的数值分解次数（测试要断言它）
   int iterationsUsed = 0;       ///< 最近一个子步用掉的 PD 迭代数

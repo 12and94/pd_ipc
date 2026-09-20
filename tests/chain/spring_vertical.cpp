@@ -137,9 +137,16 @@ TEST(iterationCountDoesNotChangeFixedPoint) {
     results.push_back(ctx.mesh.positions[1].y);
   }
   // 50 次迭代视为已收敛到不动点，前两者应快速逼近它。
+  //
+  // 实测：三者在**机器精度上完全相同**（差 0 / 0）。这符合理论：单弹簧下局部投影
+  // 恒为 d_c = -ℓŷ（与 x 无关），矩阵又已含 k，所以一次迭代就精确到达不动点。
+  // 因此这里按机器精度断言 —— 容差给 0.05 之类是没有分辨力的假断言。
+  std::printf("    [注] 1/5/50 次迭代结果: %.15f %.15f %.15f  (差 %.3g / %.3g)\n", results[0],
+              results[1], results[2], std::fabs(results[0] - results[2]) / restLength,
+              std::fabs(results[1] - results[2]) / restLength);
   CHECK_NEAR(results[2] / restLength, closedFormRoot(y0 - h * h * 9.81, mass, k, restLength, h) / restLength, 1e-12);
-  CHECK_LE(std::fabs(results[1] - results[2]) / restLength, 1e-10);
-  CHECK_LE(std::fabs(results[0] - results[2]) / restLength, 0.05);  // 1 次迭代有可见偏差
+  CHECK_LE(std::fabs(results[1] - results[2]) / restLength, 1e-15);
+  CHECK_LE(std::fabs(results[0] - results[2]) / restLength, 1e-15);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +375,191 @@ TEST(globalMatrixIsFactoredOnceAndReused) {
   CHECK_MSG(ctx.factorizeCount == before,
             "拖拽把手 / 改阻尼不改变 L，不允许重分解");
   CHECK(std::isfinite(ctx.mesh.positions[0].y));
+}
+
+// ---------------------------------------------------------------------------
+// 8) 线性残差（docs/plan.md §M1 验收 3）：全局步解出的 x 必须满足 L x = b。
+//
+//    这是**直接法求解器本身**的唯一正确性判据：迭代收敛、能量有界这类现象都
+//    可能在"求解器返回了近似解"时依然成立，只有残差能把它们区分开。
+//    同时验证"一次分解、改右端后复用"确实给出对应新右端的精确解
+//    （若复用实现有缓存错误，残差会立刻暴露）。
+// ---------------------------------------------------------------------------
+TEST(globalSolveResidualIsMachinePrecision) {
+  const Scalar mass = 0.05, restLength = 0.1, k = 1.0e4, h = 1.0 / 120.0;
+  SimContext ctx = makeTwoVertexSpring(0.13, 0.0, mass, restLength, k, h);
+  ctx.config.maxIterations = 5;
+  stepOnce(ctx);
+
+  auto residual = [&](const Eigen::VectorXd& x, const Eigen::VectorXd& b) {
+    const Eigen::VectorXd r = ctx.L * x - b;
+    return r.lpNorm<Eigen::Infinity>();
+  };
+  auto rhsScale = [&](const Eigen::VectorXd& b) {
+    return std::max(1.0, b.lpNorm<Eigen::Infinity>());
+  };
+
+  const Scalar rel1 = residual(ctx.xSolution, ctx.b) / rhsScale(ctx.b);
+  CHECK_MSG(rel1 < 1e-12, "L x = b 的相对残差应为机器精度量级");
+
+  // 反证：这个判据必须**有分辨力** —— 把解动一下，残差必须显著变大。
+  {
+    Eigen::VectorXd perturbed = ctx.xSolution;
+    perturbed[4] += 1e-6;
+    CHECK_MSG(residual(perturbed, ctx.b) / rhsScale(ctx.b) > 1e-9,
+              "残差判据必须能察觉 1e-6 的解扰动（否则它没有分辨力）");
+  }
+
+  // 复用同一个分解，改右端后重解：必须给出与新右端对应的精确解。
+  {
+    const int factorizeBefore = ctx.factorizeCount;
+    Eigen::VectorXd b2 = ctx.b;
+    b2[4] += 0.037;  // 只动自由顶点那一行
+    Eigen::VectorXd x2;
+    ctx.solver->solve(b2, x2);
+    CHECK_MSG(ctx.factorizeCount == factorizeBefore, "改右端不应触发重分解");
+    const Scalar rel2 = residual(x2, b2) / rhsScale(b2);
+    CHECK_MSG(rel2 < 1e-12, "复用分解解新右端，残差同样应是机器精度量级");
+    // 解必须真的变了（否则说明 solve 用了缓存的旧解）。
+    CHECK_MSG(std::fabs(x2[4] - ctx.xSolution[4]) > 1e-9, "改右端后解必须随之改变");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9) 固定点与收敛（docs/plan.md §M1 验收 4）：无重力、无阻尼、从变形初始态出发，
+//    反复迭代后收敛到不动点，且该不动点满足"每条边回到静止长度"。
+//
+//    做法：每个子步只允许**一次** PD 迭代（maxIterations=1），于是"子步"退化成
+//    "一次 PD 迭代"，"连续子步之间位置不再变化"就等于"迭代收敛到不动点"。
+//
+//    **两个收敛容差都不能给负值/大值来"强制跑满"**：判据是
+//        if (diff <= absTolerance || rel <= relTolerance) break;
+//    链在几次迭代内就能到达机器精度的不动点，此时 rel 恰好为 0，而
+//    `rel <= 0` 恒成立 —— 用 relTolerance=0 会让它立刻退出（这正是本测试
+//    最初写错的地方）。所以这里用 maxIterations=1 限制每次迭代数，
+//    让循环由"位置不再变化"这个外部判据来控制。
+// ---------------------------------------------------------------------------
+TEST(iterationConvergesToFixedPointWithoutGravityOrDamping) {
+  const Scalar restLength = 0.1, k = 1.0e3, h = 1.0 / 120.0;
+  const int n = 12;
+
+  SimContext ctx;
+  ctx.config.dt = h;
+  ctx.config.gravity = Vec3{0.0, 0.0, 0.0};
+  ctx.config.stiffness = k;
+  ctx.config.velocityDamping = 0.0;
+  ctx.config.maxIterations = 1;  // 一个子步 = 一次 PD 迭代
+  ctx.config.relTolerance = 0.0;
+  ctx.config.absTolerance = 0.0;
+  ctx.config.substepsPerFrame = 1;
+
+  Mesh& m = ctx.mesh;
+  m.positions.clear();
+  m.restPositions.clear();
+  m.velocities.clear();
+  m.masses.clear();
+  for (int i = 0; i < n; ++i) {
+    // 刻意把链摆在一条斜线上、且初始间距大于 ℓ：不动点需要真正迭代才能到。
+    m.positions.push_back(Vec3{0.03 * i, 0.11 * i, 0.0});
+    m.restPositions.push_back(Vec3{0.03 * i, 0.11 * i, 0.0});
+    m.velocities.push_back(Vec3{});
+    m.masses.push_back(0.05);
+  }
+  m.pinned.assign(static_cast<std::size_t>(n), 0);  // 无 pin
+  m.pinPositions = m.positions;
+  for (int i = 0; i + 1 < n; ++i) m.edges.push_back(Edge{i, i + 1, restLength, k});
+  m.buildSparsityPattern();
+  ensureBuffers(ctx);
+
+  // 迭代到位置不再有明显变化（有上限保护，避免不收敛时死循环）。
+  //
+  // 判据用**绝对容差 1e-12**、而不是"逐位不变"：本格式下收敛是渐近的
+  // （实测 5000 次后单步变化仍有 ~9e-14），要求"变化恰好为 0"是错误期望。
+  const Scalar kConverged = 1e-12;
+  const int kMaxSteps = 50000;
+  int steps = 0;
+  Scalar lastChange = 0.0;
+  for (; steps < kMaxSteps; ++steps) {
+    const std::vector<Vec3> before = m.positions;
+    stepOnce(ctx);
+    Scalar change = 0.0;
+    for (int i = 0; i < n; ++i) {
+      change = std::max(change, maxAbsComponent(m.positions[static_cast<std::size_t>(i)] -
+                                                before[static_cast<std::size_t>(i)]));
+    }
+    lastChange = change;
+    if (change <= kConverged) break;
+  }
+  std::printf("    [注] 自由链 n=%d：%d 次迭代收敛，单步变化 %.3g（判据 %.0e）\n", n, steps + 1,
+              lastChange, kConverged);
+  CHECK_MSG(lastChange <= kConverged, "自由链的单步位移必须收敛到判据以下");
+  CHECK_MSG(steps + 1 < kMaxSteps, "必须在上限之前收敛（否则说明不收敛）");
+
+  // 不动点本身：无重力、无外力 ⇒ 弹簧力为零 ⇒ 每条边恰好回到静止长度。
+  Scalar worstStrain = 0.0;
+  for (const auto& e : m.edges) {
+    const Scalar len = length(m.positions[static_cast<std::size_t>(e.a)] -
+                              m.positions[static_cast<std::size_t>(e.b)]);
+    worstStrain = std::max(worstStrain, std::fabs(len - restLength) / restLength);
+  }
+  CHECK_MSG(worstStrain < 1e-9, "无重力自由链的不动点必须使每条边回到静止长度");
+
+  // 总长 = (n-1)·ℓ（各段独立回到 ℓ）。
+  Scalar total = 0.0;
+  for (const auto& e : m.edges) {
+    total += length(m.positions[static_cast<std::size_t>(e.a)] -
+                    m.positions[static_cast<std::size_t>(e.b)]);
+  }
+  CHECK_NEAR(total, (n - 1) * restLength, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// 10) 运行时改变稀疏结构必须重新做符号分解。
+//
+//     数值分解看"数值戳"（刚度/质量/h）就够了，但**符号分解看的是结构**：
+//     `assembleMatrix` 只在两端都自由时写耦合块 -κI，所以给一个原本自由的顶点
+//     加 pin，会让那一行的非对角块消失 → L 的稀疏结构变了。
+//     此时若仍复用旧的符号分解，factorize 一个结构不同的矩阵后 solve 会访问
+//     未定义数据（IGlobalSolver.h 明确记录了这次教训：实测表现为访问违例）。
+//
+//     本测试就是那个场景。它同时也是一条回归门禁：把 analyze 的条件改回
+//     "只在首次调用"时，本测试必须失败（否则门禁没有分辨力）。
+// ---------------------------------------------------------------------------
+TEST(pinMaskChangeReanalyzesSparsityPattern) {
+  SceneConfig cfg;
+  cfg.gridNx = 6;
+  cfg.gridNy = 6;
+  cfg.gridSpacing = 0.05;
+  cfg.stiffness = 1.0e4;
+  cfg.maxIterations = 4;
+  cfg.relTolerance = 0.0;
+  cfg.absTolerance = 0.0;
+  cfg.substepsPerFrame = 1;
+
+  SimContext ctx = makeScene(cfg);
+  stepOnce(ctx);
+  CHECK(ctx.solver->stats().analyzeCalls == 1);
+  for (int s = 0; s < 5; ++s) stepOnce(ctx);
+  CHECK_MSG(ctx.solver->stats().analyzeCalls == 1,
+            "拓扑与 pin 掩码都没变时，符号分解不应重复发生");
+
+  // 给一个原本自由的内部顶点加 pin —— 这会删掉该行的耦合块。
+  const int v = 2 * cfg.gridNx + 2;  // 从顶边数第二行的一个内部顶点
+  CHECK(ctx.mesh.pinned[static_cast<std::size_t>(v)] == 0);
+  ctx.mesh.pinned[static_cast<std::size_t>(v)] = 1;
+  ctx.mesh.pinPositions[static_cast<std::size_t>(v)] = ctx.mesh.positions[static_cast<std::size_t>(v)];
+
+  stepOnce(ctx);  // 这里必须重新 analyze，否则 solve 踩未定义数据
+  CHECK_MSG(ctx.solver->stats().analyzeCalls == 2, "pin 掩码改变后必须重新做符号分解");
+
+  // 继续跑：结构已稳定，不应再重复 analyze，也不应再分解。
+  const int factorizeAfter = ctx.factorizeCount;
+  for (int s = 0; s < 5; ++s) stepOnce(ctx);
+  CHECK_MSG(ctx.solver->stats().analyzeCalls == 2, "结构稳定后不应重复符号分解");
+  CHECK_MSG(ctx.factorizeCount == factorizeAfter, "结构稳定后不应重复数值分解");
+
+  // 结果仍然有限（跑通即可，位置正确性由其它项覆盖）。
+  CHECK(std::isfinite(ctx.mesh.positions[static_cast<std::size_t>(v)].y));
 }
 
 TEST_MAIN("chain/spring_vertical")

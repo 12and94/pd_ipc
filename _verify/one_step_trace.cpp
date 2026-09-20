@@ -14,9 +14,12 @@
 using namespace pd;
 
 int main() {
-  const Scalar h = 1.0 / 120.0, m = 0.05, ell = 0.1, k = 1.0e4, g = 9.81;
+  const Scalar h = 1.0 / 120.0, m = 0.05, ell = 0.1, k = 1.0e4;
   const Scalar gAcc = 9.81;                       // |g|
-  const Scalar yStar = ell + m * gAcc / k;        // 候选平衡 = 0.10004905
+  // 排查期曾把 ℓ + m g/κ 当作"候选平衡"（= 0.10004905）。**这是错的**：
+  // 它是能量的极大值，正确的离散平衡是 ℓ - m g/κ = 0.09995095（见 pd_check 第 3 项）。
+  // 这里保留旧值只是为了让本程序仍能复现当时的对照打印，不要据此改实现。
+  const Scalar yStarLegacy = ell + m * gAcc / k;  // [已废弃的候选值] 0.10004905
 
   SimContext ctx;
   ctx.config.dt = h;
@@ -28,7 +31,7 @@ int main() {
   ctx.config.absTolerance = 0.0;
 
   Mesh& mesh = ctx.mesh;
-  mesh.positions = {Vec3{0.0, 0.0, 0.0}, Vec3{0.0, yStar, 0.0}};
+  mesh.positions = {Vec3{0.0, 0.0, 0.0}, Vec3{0.0, yStarLegacy, 0.0}};
   mesh.restPositions = mesh.positions;
   mesh.velocities = {Vec3{}, Vec3{}};
   mesh.masses = {m, m};
@@ -40,18 +43,18 @@ int main() {
 
   // ---- 解析预期 ----
   const Scalar mh2 = m / (h * h);
-  const Scalar yHat = yStar - h * h * gAcc;   // x̂ = x + h·0 + h²g（g 沿 -y）
+  const Scalar yHat = yStarLegacy - h * h * gAcc;   // x̂ = x + h·0 + h²g（g 沿 -y）
   const Scalar dcY = -(ell);                   // A_c x = x_a - x_b，a=0(pin), b=1(free) ⇒ d_c.y = -ℓ
   const Scalar scatterAnalytic = -k * dcY;     // b_1 -= κ d_c ⇒ 自由端收到 -κ d_c.y = +κℓ
   const Scalar y1Analytic = (mh2 * yHat + scatterAnalytic) / (mh2 + k);
 
-  std::printf("输入: y* = %.10g, v = 0, h = 1/120, m = %.4g, ℓ = %.4g, κ = %.6g\n\n", yStar, m, ell, k);
+  std::printf("输入: y* = %.10g, v = 0, h = 1/120, m = %.4g, ℓ = %.4g, κ = %.6g\n\n", yStarLegacy, m, ell, k);
   std::printf("解析:\n");
   std::printf("  预测 ŷ            = y* - h²|g| = %.12g\n", yHat);
   std::printf("  d_c.y             = %.12g\n", dcY);
   std::printf("  自由端散射        = -κ·d_c.y = %+.12g\n", scatterAnalytic);
   std::printf("  L_11 = m/h² + κ   = %.12g\n", mh2 + k);
-  std::printf("  y1 = (m/h²·ŷ + 散射)/L_11 = %.12g   （应等于 y* = %.12g）\n\n", y1Analytic, yStar);
+  std::printf("  y1 = (m/h²·ŷ + 散射)/L_11 = %.12g   （应等于 y* = %.12g）\n\n", y1Analytic, yStarLegacy);
 
   // ---- 代码的中间量 ----
   std::vector<Vec3> targets;
@@ -83,7 +86,7 @@ int main() {
   ctx2.config = ctx.config;
   {
     Mesh& mm = ctx2.mesh;
-    mm.positions = {Vec3{0.0, 0.0, 0.0}, Vec3{0.0, yStar, 0.0}};
+    mm.positions = {Vec3{0.0, 0.0, 0.0}, Vec3{0.0, yStarLegacy, 0.0}};
     mm.restPositions = mm.positions;
     mm.velocities = {Vec3{}, Vec3{}};
     mm.masses = {m, m};

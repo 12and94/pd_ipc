@@ -49,8 +49,7 @@ inline void reportFailure(const char* file, int line, const std::string& what) {
 }
 
 inline int runAll(const char* suiteName) {
-  std::printf("=== %s: %zu 个测试 ===\n", suiteName, registry().size());
-  int failedTests = 0;
+  std::printf("=== %s: %zu 个测试 ===\n", suiteName, registry().size());  int failedTests = 0;
   for (auto& t : registry()) {
     const int before = failureCount();
     std::printf("  [run ] %s\n", t.name.c_str());
@@ -62,8 +61,9 @@ inline int runAll(const char* suiteName) {
       std::printf("  [ok  ] %s\n", t.name.c_str());
     }
   }
-  std::printf("--- %s: %zu 个断言, %d 个失败测试, %d 个失败断言 ---\n", suiteName, checkCount(),
-              failedTests, failureCount());
+  // checkCount() 返回 int，而 %zu 期待 size_t —— 显式转换，免得换编译器/换警告等级时炸出格式警告。
+  std::printf("--- %s: %zu 个断言, %d 个失败测试, %d 个失败断言 ---\n", suiteName,
+              static_cast<std::size_t>(checkCount()), failedTests, failureCount());
   return failedTests == 0 ? 0 : 1;
 }
 

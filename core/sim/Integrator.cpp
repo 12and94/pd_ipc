@@ -85,9 +85,15 @@ int stepOnce(SimContext& ctx) {
     const SolverStamp now = computeStamp(m, h, cfg.velocityDamping, ctx.topologyId);
     if (!ctx.stampValid || now != ctx.stamp) {
       assembleLeftHandSide(m, h, cfg.velocityDamping, ctx.L);
-      if (!ctx.solver->analyzed()) {
-        // 首次（或拓扑变化后）：先按真实矩阵的结构做符号分解，再数值分解。
+      // 符号分解的判定与数值分解**不同**：数值分解看数值戳（刚度/mass/h），
+      // 符号分解还要看**稀疏结构**。pin 掩码变化会让"两端都自由"的耦合块消失，
+      // 结构随之变化 —— 那时必须重新 analyze，否则 factorize 一个结构不同的矩阵后
+      // solve 会访问未定义数据（见 IGlobalSolver.h，本项目因此踩过一次访问违例）。
+      const uint64_t structureNow = computeStructureStamp(m, ctx.topologyId);
+      if (!ctx.solver->analyzed() || structureNow != ctx.structureStamp) {
+        // 结构变了（或首次）：按**真实矩阵**的结构重新做符号分解，再数值分解。
         ctx.solver->analyze(3 * n, ctx.L);
+        ctx.structureStamp = structureNow;
       }
       ctx.solver->factorize(ctx.L);
       ctx.stamp = now;

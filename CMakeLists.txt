@@ -45,7 +45,9 @@ if(MSVC)
   # /bigobj：模板实例较多时避免 obj 段数超限
   target_compile_options(pd_core PUBLIC /W4 /permissive- /bigobj /utf-8)
   # Eigen 与 MSVC 的已知组合：定义这个宏可避免部分对齐相关的告警
-  target_compile_definitions(pd_core PUBLIC EIGEN_MPL2_ONLY)
+  # _CRT_SECURE_NO_WARNINGS：代码用 std::getenv 读诊断开关（PD_TRACE_STEP 等），
+  #   只有测试/调试程序会用到，用 _dupenv_s 换来的复杂度不值得。
+  target_compile_definitions(pd_core PUBLIC EIGEN_MPL2_ONLY _CRT_SECURE_NO_WARNINGS)
 endif()
 
 if(OpenMP_CXX_FOUND)

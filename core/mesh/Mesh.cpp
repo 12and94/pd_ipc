@@ -153,7 +153,16 @@ void Mesh::computeMassesFromSurfaces(Scalar density) {
 }
 
 void Mesh::computeMassesFromEdges(Scalar density) {
-  // 用静止长度作为"面积份额"的代理：规则网格下与三角形法一致（每个顶点 4 条半长边）。
+  // 用静止长度的平方作为"面积份额"的代理：每条边给两端各 density·ℓ²/2。
+  //
+  // **注意这不等于三角形法**（旧注释曾写成"规则网格下与三角形法一致"，是错的）：
+  //   · 规则网格间距 ℓ：内部顶点 4 条边 → m = 2ρℓ²；边顶点 1.5ρℓ²；角顶点 1.0ρℓ²。
+  //     而三角形法（每顶点 6 个三角形的一半）给的是 ρℓ²。**两者差 2 倍**。
+  //   · 因此质量在网格上不均匀，且总质量是三角形法的 2 倍。
+  //
+  // 之所以保留这个口径：它使"真实物理质量 = density 参数"的意义更直观（内部顶点恰为
+  // 2ρℓ²），且基准测出的所有数字都挂在这个口径上（见 docs/plan.md §2.1 的说明）。
+  // 若将来要改成面积法，须同时重标定刚度默认值——两者都进 M/h² 与 κ 的比值。
   const int n = vertexCount();
   masses.assign(static_cast<std::size_t>(n), 0.0);
   for (const auto& e : edges) {

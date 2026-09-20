@@ -89,7 +89,7 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
     for (int c = 0; c < ne; ++c) {
       const Edge& e = mesh.edges[static_cast<std::size_t>(c)];
       // 散射项 κ_c d_c：与对角块 +κ_c I、耦合块 -κ_c I 配对。
-      // 配错符号会让弹簧力整体反号（稳态跑到 ℓ - m g/κ）。
+      // 配错符号会让弹簧力整体反号，稳态会跑到 ℓ + m g/κ（而不是正确的 ℓ - m g/κ）。
       const Vec3 contribution = targets[static_cast<std::size_t>(c)] * e.stiffness;
 
       const bool aPinned = mesh.isPinned(e.a);
@@ -193,7 +193,7 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
     const bool bPinned = mesh.isPinned(e.b);
     if (aPinned && bPinned) continue;
     // 散射项 κ_c d_c：与对角块 +κ_c I、耦合块 -κ_c I 配对。
-    // 配错符号会让弹簧力整体反号（稳态跑到 ℓ - m g/κ）。
+    // 配错符号会让弹簧力整体反号，稳态会跑到 ℓ + m g/κ（而不是正确的 ℓ - m g/κ）。
     const Vec3 contribution = targets[static_cast<std::size_t>(c)] * e.stiffness;
     const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
     const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
