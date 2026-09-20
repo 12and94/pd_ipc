@@ -100,9 +100,11 @@ int main(int argc, char** argv) {
   std::printf("=== PD 布料基准（CPU 方向 1）===\n");
   std::printf("顶点 %d  约束 %d  质量 %.6g  线程 %d\n", ctx.mesh.vertexCount(), ctx.mesh.edgeCount(),
               ctx.mesh.totalMass(), numThreads());
-  std::printf("L 自由度 %d  nnz %lld\n", 3 * ctx.mesh.vertexCount(), ctx.solver->stats().nnz);
-  std::printf("dt %.6g  子步/帧 %d  刚度 %.6g  PD 迭代上限 %d  容差 %.3g\n\n", cfg.dt,
+  std::printf("dt %.6g  子步/帧 %d  刚度 %.6g  PD 迭代上限 %d  容差 %.3g\n", cfg.dt,
               cfg.substepsPerFrame, cfg.stiffness, cfg.maxIterations, cfg.relTolerance);
+  std::printf("（L 的自由度 %d，nnz 在下方「分解复用」一节给出；"
+              "符号/数值分解推迟到首次 stepOnce 内完成）\n\n",
+              3 * ctx.mesh.vertexCount());
 
   resetStageTimes(ctx);
 
@@ -145,6 +147,7 @@ int main(int argc, char** argv) {
 
   const auto& st = ctx.solver->stats();
   std::printf("\n--- 分解复用（方向 1 的核心）---\n");
+  std::printf("  L 自由度 %d  nnz %lld\n", 3 * ctx.mesh.vertexCount(), st.nnz);
   std::printf("  符号分解 %d 次  数值分解 %d 次  回代 %d 次\n", st.analyzeCalls, st.factorizeCalls,
               st.solveCalls);
   std::printf("  符号分解耗时 %.3f ms\n", st.lastAnalyzeSeconds * 1e3);
