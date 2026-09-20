@@ -50,6 +50,22 @@ struct SceneConfig {
   /// 收敛不足是外层迭代能力问题，不是门槛松紧问题（见 tests/chain/convergence_criterion.cpp）。
   Scalar absTolerance = 1.0e-12;
 
+  /// **非线性残差判据（推荐）**：不平衡力相对于重力量级的比值上限。≤0 表示禁用。
+  ///
+  /// 残差定义为"当前位形离本子步不动点还有多远"，单位 m/s²：
+  ///     r_i = |(m_i/h²)(x_i - x̂_i) - m_i·g - f_i^int| / m_i
+  /// 其中 f^int 是距离约束的弹性力。不动点处 r = 0（这是**位移判据做不到**的：
+  /// 位移小只说明"这一步没怎么动"，不说明"离正确解近"）。
+  ///
+  /// 为什么必须要有它：高刚度下 PD 外层迭代收敛极慢，收缩因子
+  /// q = κ/(κ + m/h²)。工作点 κ=1e5、m/h²=11.52 时 q ≈ 0.99988，
+  /// 40 次迭代只能完成切向运动的 0.46%（见 tests/chain/convergence_criterion.cpp）。
+  /// 此时"相邻迭代位移小"完全无法反映求解质量，必须直接量不平衡力。
+  ///
+  /// 默认 1e-3 的含义：不平衡力不超过重力的千分之一。物理上可忽略，
+  /// 且比"位移判据"更贴近"这个子步解好了没有"。
+  Scalar residualTolerance = 1.0e-3;
+
   // ---- 规模 ----
   int gridNx = 40;
   int gridNy = 40;
@@ -86,6 +102,8 @@ struct SimContext {
   int iterationsUsed = 0;       ///< 最近一个子步用掉的 PD 迭代数
   int earlyExitCount = 0;       ///< 累计"未跑满 maxIterations 就判收敛退出"的子步数
                                 ///< （诊断用：判断收敛判据是否过于宽松的关键指标）
+  Scalar lastResidual = -1.0;   ///< 最近一次迭代的**非线性残差**（m/s²，最大不平衡力/质量）
+                                ///< 负值表示本子步未启用残差判据（residualTolerance <= 0）
 
   std::vector<Vec3> predicted;  ///< 预测位置 x̂
   std::vector<Vec3> positionsBeforeStep;      ///< 本子步开始时的位置（速度更新用）

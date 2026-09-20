@@ -44,6 +44,7 @@ SimContext makeTangentialSpring(Scalar mass, Scalar restLength, Scalar kappa, in
   ctx.config.maxIterations = iters;
   ctx.config.relTolerance = 0.0;  // 关闭全部提前退出，强制跑满迭代数
   ctx.config.absTolerance = 0.0;
+  ctx.config.residualTolerance = 0.0;  // 残差判据也必须关（三者是 OR 关系）
   ctx.config.substepsPerFrame = 1;
 
   Mesh& m = ctx.mesh;
@@ -227,6 +228,7 @@ TEST(zeroToleranceDisablesEarlyExit) {
   cfg.maxIterations = 5;      // 上限很小，便于观察是否被提前退出打断
   cfg.relTolerance = 0.0;     // 禁用
   cfg.absTolerance = 0.0;     // 禁用
+  cfg.residualTolerance = 0.0;  // 禁用（三个判据是 OR 关系，少关一个就测不出"跑满"）
   SimContext ctx = makeScene(cfg);
   for (int i = 0; i < 12; ++i) ctx.mesh.pinned[static_cast<std::size_t>(11 * 12 + i)] = 1;
   refreshPinPositions(ctx);

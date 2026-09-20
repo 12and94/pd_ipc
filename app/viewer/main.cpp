@@ -406,6 +406,7 @@ int main(int argc, char** argv) {
   double tol = 1.0e-5;
   double damping = 0.02;
   bool noEarlyExit = false;   // 关闭全部提前退出，强制每子步跑满 --iters
+  double residualTol = -1.0;  // <0 表示用 SceneConfig 的默认值
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -418,6 +419,7 @@ int main(int argc, char** argv) {
     else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (a == "--tol" && i + 1 < argc) tol = std::atof(argv[++i]);
     else if (a == "--damping" && i + 1 < argc) damping = std::atof(argv[++i]);
+    else if (a == "--residual-tol" && i + 1 < argc) residualTol = std::atof(argv[++i]);
     else if (a == "--no-early-exit") noEarlyExit = true;
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -456,6 +458,10 @@ int main(int argc, char** argv) {
   cfg.maxIterations = iters;
   cfg.relTolerance = noEarlyExit ? 0.0 : tol;
   cfg.absTolerance = noEarlyExit ? 0.0 : cfg.absTolerance;
+  // 残差判据也必须一起关掉，否则 --tol 0 / --no-early-exit 仍会提前退出
+  // （它是本项目 2026-09-20 新增的判据，默认 1e-3，与位移判据是 OR 关系）。
+  if (noEarlyExit) cfg.residualTolerance = 0.0;
+  if (residualTol >= 0.0) cfg.residualTolerance = residualTol;
   cfg.velocityDamping = damping;  // 历史缺陷：解析了 --damping 却没赋给 cfg，该选项不生效
   SimContext ctx = makeScene(cfg);
 

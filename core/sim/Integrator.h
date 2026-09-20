@@ -29,4 +29,12 @@ Scalar totalEnergy(const SimContext& ctx);
 /// 最大速度绝对值（诊断用）。
 Scalar maxSpeed(const SimContext& ctx);
 
+/// 当前位形的**非线性残差**（单位 m/s²）：最大顶点上的不平衡力除以该点质量。
+///
+/// 不动点处应为 0。它衡量的是"离本子步的解还有多远"，而不是"这一步动了多少"：
+/// 高刚度下 PD 外层迭代收敛极慢（收缩因子 q = κ/(κ + m/h²)），相邻迭代位移
+/// 很小但离正确解仍很远，此时只能用残差判断收敛质量。
+/// 要求 ctx.targets 是当前位置的投影（stepOnce 每个迭代都会更新它）。
+Scalar nonlinearResidual(const SimContext& ctx);
+
 }  // namespace pd

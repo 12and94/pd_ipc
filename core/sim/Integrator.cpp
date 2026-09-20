@@ -28,6 +28,12 @@ bool traceEnabled() {
   return on;
 }
 
+/// 诊断开关：设置 PD_DEBUG_RESIDUAL=1 时，即使残差判据被关闭也计算并打印残差。
+bool debugResidual() {
+  static const bool on = (std::getenv("PD_DEBUG_RESIDUAL") != nullptr);
+  return on;
+}
+
 #define PD_TRACE(...)                             \
   do {                                            \
     if (traceEnabled()) {                         \
@@ -37,7 +43,86 @@ bool traceEnabled() {
     }                                             \
   } while (0)
 
+/// 本子步的**非线性残差**（单位 m/s²）：最大顶点上的不平衡力除以该点质量。
+///
+/// 推导：本子步的不动点条件是（自由顶点，见 docs/plan.md §2.2.1）
+///     (m_i/h²)(x_i - x̂_i) - m_i·g - f_i^int = 0
+/// 其中距离约束的弹性力 f_i^int 等于"散射进右端的那一项"的相反数：
+///     f_i^int = -Σ_c κ_c d_c(x)   （a 端 +κd_c、b 端 -κd_c）
+/// 于是每个顶点的不平衡加速度为
+///     r_i = |(m_i/h²)(x_i - x̂_i) + Σ_c κ_c d_c| / m_i
+/// 注意这里**不含重力项**：重力已经通过 x̂ = x + hv + h²g 进入，且只进入一次
+/// （在右端再补 -Mg 就是把重力算两遍，本项目踩过这个坑）。x 到达不动点时
+/// 上式整体为 0，因此它就是"离不动点还有多远"的度量。
+///
+/// 为什么不能用"相邻迭代位移"代替它：位移小只说明这一步没怎么动。
+/// 高刚度下更新量是被 L 预条件后的梯度，小更新不保证小物理残差
+/// （κ=1e5 时 40 次迭代只完成切向运动的 0.46%，而位移看起来"已经很小"）。
 }  // namespace
+
+Scalar nonlinearResidual(const SimContext& ctx) {
+  const Mesh& m = ctx.mesh;
+  const int n = m.vertexCount();
+  const Scalar invH2 = 1.0 / (ctx.config.dt * ctx.config.dt);
+
+  // 约束力的正确形式：f^int = κ(AᵀA x − Aᵀ d) —— **两部分都要**。
+  //   推导：真实弹性力 κ(r−ℓ)·unit(x_a−x_b) = κA x − κ ℓ·unit = κA x − κ d_c
+  //   按顶点 a、b 展开后，a 端得 +κ(x_a−x_b) − κ d_c，b 端得 −κ(x_a−x_b) + κ d_c。
+  //   **只取 κd_c 一侧是错的**（那是散射项，不是力）：本项目实测只取 κd_c 时
+  //   残差为 7.07e6 m/s²，而应变 1e-4 的弹簧其力只有 0.2 N 量级 —— 差了 4 个数量级。
+  //   原因：x = x̂、v = 0 时 κAᵀA x 与 κAᵀd 各自都是 O(κℓ)，只有两者之差才是 O(κ(r−ℓ))。
+  static std::vector<Scalar> force;
+  force.assign(static_cast<std::size_t>(n) * 3, Scalar{0});
+  for (std::size_t c = 0; c < m.edges.size(); ++c) {
+    const Edge& e = m.edges[c];
+    const Vec3 rel = m.positions[static_cast<std::size_t>(e.a)] -
+                     m.positions[static_cast<std::size_t>(e.b)];  // A_c x
+    const Vec3 kd = ctx.targets[c] * e.stiffness;                // κ_c d_c
+    const Vec3 contrib = rel * e.stiffness - kd;                 // κ(A_c x − d_c)
+    const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
+    const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
+    force[ia + 0] += contrib.x;
+    force[ia + 1] += contrib.y;
+    force[ia + 2] += contrib.z;
+    force[ib + 0] -= contrib.x;
+    force[ib + 1] -= contrib.y;
+    force[ib + 2] -= contrib.z;
+  }
+
+  Scalar worst = 0.0;
+  int worstVertex = -1;
+  for (int v = 0; v < n; ++v) {
+    if (m.isPinned(v)) continue;  // pinned 顶点不是未知量，其行被整行覆盖
+    const std::size_t i = static_cast<std::size_t>(v);
+    const Scalar mass = m.masses[i];
+    if (mass <= 0.0) continue;
+    const Vec3 inertia = (m.positions[i] - ctx.predicted[i]) * (mass * invH2);
+    const Vec3 total{inertia.x + force[i * 3 + 0], inertia.y + force[i * 3 + 1],
+                     inertia.z + force[i * 3 + 2]};
+    const Scalar r = length(total) / mass;
+    if (r > worst) {
+      worst = r;
+      worstVertex = v;
+    }
+  }
+
+  // 调试开关：PD_DEBUG_RESIDUAL=1 时打印最大残差顶点的逐项分解，
+  // 并**同时**打印"静力不平衡" |f_int/m - g| —— 后者是另一种口径
+  // （只看弹性力与重力是否平衡、不含惯性项），用于和外部诊断对照。
+  if (std::getenv("PD_DEBUG_RESIDUAL") != nullptr && worstVertex >= 0) {
+    const std::size_t i = static_cast<std::size_t>(worstVertex);
+    const Scalar mass = m.masses[i];
+    const Vec3 inertia = (m.positions[i] - ctx.predicted[i]) * (mass * invH2);
+    const Vec3 f{force[i * 3 + 0], force[i * 3 + 1], force[i * 3 + 2]};
+    const Vec3 staticImbalance = f / mass - ctx.config.gravity;
+    std::fprintf(stderr,
+                 "[residual] 顶点 %d  |x-x̂|=%.3e  |inertia|=%.3e  |f_int|=%.3e  "
+                 "|inertia+f_int|/m=%.6e m/s^2  |f_int/m-g|=%.6e m/s^2\n",
+                 worstVertex, length(m.positions[i] - ctx.predicted[i]), length(inertia), length(f),
+                 worst, length(staticImbalance));
+  }
+  return worst;
+}
 
 void resetStageTimes(SimContext& ctx) { ctx.times = StageTimes{}; }
 
@@ -177,13 +262,32 @@ int stepOnce(SimContext& ctx) {
       scale = std::max(scale, length(cfg.gravity) * h * h);
       previous = m.positions;
       const Scalar rel = (scale > 0.0) ? diff / scale : diff;
-      PD_TRACE("迭代 %d: |Δx|∞ = %.6g  相对(本步位移) %.6g  参照 %.6g", usedIterations, diff, rel,
-               scale);
+
       // 注意 absTolerance 用 "> 0" 判定禁用：若只写成 diff <= cfg.absTolerance，
       // 传 0 会因 diff==0 时恒成立而立刻退出（tests/chain 里记录过这个坑）。
       const bool absHit = (cfg.absTolerance > 0.0) && (diff <= cfg.absTolerance);
       const bool relHit = (cfg.relTolerance > 0.0) && (rel <= cfg.relTolerance);
-      if (absHit || relHit) {
+
+      // 非线性残差判据：直接量"离本子步不动点还有多远"。
+      // 位移类判据在高刚度下会失真 —— 更新量是被 L 预条件后的梯度，
+      // 小更新不保证小物理残差（κ=1e5 时 40 次迭代只完成切向运动的 0.46%，
+      // 而单步位移看起来已经很小）。
+      // 注意：调试开关 PD_DEBUG_RESIDUAL 要求**即使判据关闭也要计算残差**，
+      // 否则"关掉判据"的对照运行里就看不到残差读数了。
+      Scalar residual = -1.0;
+      bool resHit = false;
+      const bool wantResidual = (cfg.residualTolerance > 0.0) || debugResidual();
+      if (wantResidual) {
+        residual = nonlinearResidual(ctx);
+        if (cfg.residualTolerance > 0.0) {
+          const Scalar gScale = std::max<Scalar>(length(cfg.gravity), 1.0e-12);
+          resHit = (residual <= cfg.residualTolerance * gScale);
+        }
+      }
+      ctx.lastResidual = residual;
+
+      PD_TRACE("迭代 %d: |Δx|∞=%.6g 相对=%.6g 残差=%.6g m/s^2", usedIterations, diff, rel, residual);
+      if (absHit || relHit || resHit) {
         ctx.earlyExitCount += 1;
         break;
       }
