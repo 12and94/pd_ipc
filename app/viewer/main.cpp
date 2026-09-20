@@ -407,6 +407,7 @@ int main(int argc, char** argv) {
   double damping = 0.02;
   bool noEarlyExit = false;   // 关闭全部提前退出，强制每子步跑满 --iters
   double residualTol = -1.0;  // <0 表示用 SceneConfig 的默认值
+  double dt = 1.0 / 120.0;    // 子步长 h
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -420,6 +421,7 @@ int main(int argc, char** argv) {
     else if (a == "--tol" && i + 1 < argc) tol = std::atof(argv[++i]);
     else if (a == "--damping" && i + 1 < argc) damping = std::atof(argv[++i]);
     else if (a == "--residual-tol" && i + 1 < argc) residualTol = std::atof(argv[++i]);
+    else if (a == "--dt" && i + 1 < argc) dt = std::atof(argv[++i]);
     else if (a == "--no-early-exit") noEarlyExit = true;
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -452,7 +454,7 @@ int main(int argc, char** argv) {
   cfg.gridNx = gridN;
   cfg.gridNy = gridN;
   cfg.gridSpacing = 0.02;
-  cfg.dt = 1.0 / 120.0;
+  cfg.dt = dt;
   cfg.substepsPerFrame = 2;
   cfg.stiffness = stiffness;
   cfg.maxIterations = iters;
