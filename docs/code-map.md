@@ -18,18 +18,32 @@ cd D:\dsh_workspace\pd_ipc
 ```
   1 投影长度 == 静止长度     OK
   2 单步解 == 闭式解           OK
-  3 静止平衡 == ℓ + m g/κ     NG     实测 0.09995095  期望 0.10004905  容差 1e-07
+  3 静止平衡 == ℓ - m g/κ     OK
   4 pinned 顶点严格不动        OK
   5 自由落体一步 == -h²g      OK
   6 布料有界                     OK
   7 数值分解次数 == 1          OK
+  8 弹性力符号 == -dU/dy        OK
 
-  存在错误（失败 1 项）
+  全部正确（失败 0 项）
 ```
 
 退出码 0 = 全对，1 = 有错（可用于 CI）。
-**当前状态：6 项 OK，第 3 项 NG** —— 这就是唯一未解决的问题：
-悬挂弹簧的静止平衡落在 $\ell-mg/\kappa$ 而不是 $\ell+mg/\kappa$。
+
+**关于第 3 项为什么是 $\ell-mg/\kappa$（曾经的判断错误，务必注意）**
+
+本设置的势能是 $E(y)=\frac{\kappa}{2}(y-\ell)^2+m\,g\,y$（重力向量 $g_{\rm vec}=(0,-g,0)$，坐标 $y$ 向上），
+$\mathrm{d}E/\mathrm{d}y=\kappa(y-\ell)+mg=0$ 给出 $y=\ell-mg/\kappa$。
+**这是一个受压构型**：自由点在 $+\hat y$ 侧、pin 在原点，重力把质量往下拉，
+弹性力 $\kappa(y-\ell)$ 在 $y<\ell$ 时朝 $+y$，两者反向抵消。
+
+曾经把它误判为"代码 bug"（以为平衡应在 $\ell+mg/\kappa$），并据此改了实现，反而把正确的散射符号改坏。
+要点：$y=\ell+mg/\kappa$ 是**能量的极大值**，不是平衡点；
+"悬挂在固定点下方"对应坐标 $y=-\ell-mg/\kappa$、长度 $\ell+mg/\kappa$ —— 长度与坐标不能混用。
+
+**真正需要修的缺陷（本轮已修）**：pin 消元的右端补偿项 $\kappa q$ 缺失。
+pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，必须把原耦合项 $-\kappa x_{\rm pin}$
+的贡献移到自由端右端，否则自由点会被拉向原点。判据见 `pd_trans`（平移一致性）。
 
 ---
 
@@ -53,15 +67,21 @@ cd D:\dsh_workspace\pd_ipc
 | `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + 阶段耗时）、`StageTimes` | — |
 | `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()` | 6、7 |
 
-### 2.3 约束内核（**符号问题就在这里**）
+> **`pinPositions` 契约（踩过坑）**：一旦 `mesh.pinned` 里有 1，`pinPositions` 就必须按顶点数填好，
+> 因为散射阶段要读 `pinPositions[pin]` 做消元补偿。正常流程由 `makeScene` / `refreshPinPositions`
+> 保证；**手工搭 Mesh 的代码（测试、`_verify/` 程序）极易只写 `pinned` 而漏掉它**。
+> 漏掉后越界读会表现为随机崩溃（0xC0000005，`pd_diraudit` 就这样挂过一次）；
+> 现在 `scatterInto` 会在入口直接查这个前置条件并报错退出，而不是让它变成难定位的崩溃。
+
+### 2.3 约束内核（方向约定与 pin 消元补偿都在这里）
 
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
 | `core/energy/DistanceTerm.h` | 接口：`project` / `projectOne` / `scatterInto` / `assembleMatrix` | 1、2、3 |
-| `core/energy/DistanceTerm.cpp` | **三处与方向有关的约定都在这个文件里**：<br>① `project()` 第 ~47 行：`raw = freeIsB ? (xb - xa) : (xa - xb)`（投影方向）<br>② `scatterInto()` 第 ~78/114/152 行：`contribution = targets * (-e.stiffness)`（右端散射符号）<br>③ `assembleMatrix()` 第 ~192 行：对角 `+κ`、耦合 `-κ`（矩阵块符号） | 1、2、3 |
+| `core/energy/DistanceTerm.cpp` | **三处与方向有关的约定都在这个文件里**：<br>① `project()`：`raw = x_a - x_b`，`d_c = ℓ·raw/‖raw‖`——方向只由端点顺序决定，**没有任何 pin 分支**（早期那个"强制指向自由端"的翻转已删除，见 `README.md` §4.1）<br>② `scatterInto()`（串行 / OpenMP / 非 OpenMP 三个分支）：`contribution = targets[c] * e.stiffness`，`b_a += contribution`、`b_b -= contribution`；某一端被 pin 时改为给自由端 `b_free += κ·q`（pin 消元补偿，见 `README.md` §4.2）<br>③ `assembleMatrix()`：对角 `+κ`、耦合 `-κ`，只跳过**两端都 pin** 的约束<br>三个分支（串行 / OpenMP / 非 OpenMP）必须保持一致——改一处就要改三处。 | 1、2、3 |
 
-> **排查建议**：这三处的符号必须成对。看代码时请把它们放在一起看，
-> 单看任何一处都是"对的"。第 3 项 NG 的根因就在这一组的配对上。
+> **排查建议**：这三处的符号必须成对，看代码时请放在一起看，单看任何一处都"像是对的"。
+> 另外散射里还有一段 **pin 消元补偿**（b_free += κ·q），它是独立的一项，容易漏 —— 见 §4 的说明。
 
 ### 2.4 全局矩阵组装与求解器
 
@@ -79,10 +99,9 @@ cd D:\dsh_workspace\pd_ipc
 | `core/sim/Integrator.h` | `stepOnce` / `stepFrame` / `surrogateEnergy` / `totalEnergy` / `maxSpeed` | 2、3、5、6 |
 | `core/sim/Integrator.cpp` | `stepOnce()` 的五个阶段，逐个编号：<br>**1) 预测** $\hat x=x+hv+h^2g$（第 ~60 行）——**重力只在这里出现一次**<br>**2) 判定+数值分解**（第 ~85 行）——只在 stamp 变化时执行<br>**3) 惯性右端**（第 ~105 行）<br>**4) PD 迭代**：局部步 → 散射 → 覆盖 pin → 全局回代 → 收敛判据（第 ~115–158 行）<br>**5) 速度更新与阻尼**（第 ~160–190 行） | 2、3、5、6 |
 
-> **排查建议**：第 3 项 NG 与第 5 阶段的速度更新形式直接相关。
-> 目前形式是 $v_{n+1}=(1-k_d)(x_{n+1}-x_n)/h$。
-> 把 $\hat y=y-h^2g$ 与行方程联立可得 $\kappa(y-\ell)=-mg$（错误）；
-> 要让它是 $+mg$，第 5 阶段或右端二者之一需要改。
+> **说明**：目前形式是 $v_{n+1}=(1-k_d)(x_{n+1}-x_n)/h$。
+> 重力只通过第 1 阶段的 $\hat x=x+hv+h^2g$ 进入，右端**不需要**再补外力项
+> （曾经补过 $-Mg$，那是把重力算了两遍，已撤掉）。
 
 ### 2.6 应用
 
@@ -95,12 +114,15 @@ cd D:\dsh_workspace\pd_ipc
 
 | 文件 | 用途 |
 |---|---|
-| `_verify/check.cpp` | **唯一验收程序**：7 项检查，只输出 OK/NG |
-| `_verify/one_step_trace.cpp` | 逐项打印一步的中间量（预测/投影/散射/对角/解），与解析式并排对照。**排查符号问题的主要工具** |
-| `_verify/standard_pd.cpp` | 用标准 PD 公式**独立组装并求解**，与代码组装逐项比对 |
-| `_verify/steady.cpp` | 多步稳态：从候选平衡出发是否保持不动 |
-| `_verify/fixed_point.cpp` | 枚举"矩阵块符号 × 散射符号"，看哪个让不动点满足物理力平衡 |
-| `_verify/variants.cpp` | 枚举"投影方向 × 矩阵块形式"，同时看平衡与布料稳定性 |
+| `_verify/check.cpp` | **端到端验收程序**：8 项检查，只输出 OK/NG |
+| `_verify/translation_invariance.cpp` | 平移不变性：无重力时零位移、pin 平移后相对形状不变 |
+| `_verify/chain_test.cpp` | 自由链/悬挂链与解析式对照 |
+| `_verify/direction_audit.cpp` | 投影方向三项判据（全局一致 / 物理合理 / 与标准 PD 逐位一致） |
+
+> **以下程序是排查期留下的，前提假设部分已过期，不是受支持的验收集**（见 `README.md` §4）：
+> `one_step_trace`、`standard_pd`、`steady`、`rhs_breakdown`、`force_audit`、`kappa_effect`、
+> `hang_test`、`init_audit`、`iteration_scan`、`scale_sweep`、`stiffness_calibration` 等。
+> 它们记录了当时的推理路径，可作追溯用，但结论请以 `pd_check` 与两个测试套件为准。
 
 这些程序原先只在需要时手工构建，现在 `pd_check` 已纳入常规构建；
 其余几个如需运行，在 `CMakeLists.txt` 里给它们各加两行即可（照抄 `pd_check` 的写法）。
@@ -119,11 +141,11 @@ cd D:\dsh_workspace\pd_ipc
 #   1 投影长度 == 静止长度        5 自由落体一步 == -h²g
 #   2 单步解 == 闭式解            6 布料有界
 #   3 静止平衡 == ℓ - m g/κ       7 数值分解次数 == 1
-#   4 pinned 顶点严格不动         8 弹性力方向 == -dU/dx
+#   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 45 断言
-.\build\Release\test_spring_vertical.exe    # 124 断言
+.\build\Release\test_primitives.exe         # 68 断言（12 个测试）
+.\build\Release\test_spring_vertical.exe    # 139 断言（8 个测试）
 
 # ---- 专项验证 ----
 .\build\Release\pd_diraudit.exe       # 投影方向：全局一致性 / 物理合理性 / 标准 PD 一致性
@@ -145,12 +167,13 @@ cd D:\dsh_workspace\pd_ipc
 ```
 
 查看器参数：`--grid N` 网格边长、`--stiffness K` 刚度、`--frames N` 跑够帧数自动退出、
-`--shot FILE.png` 截图（自写 PNG 编码，无图像库依赖）、`--pin-corners` 只钉两角（默认钉整条上边）。
+`--shot FILE.png` 截图（自写 PNG 编码，无图像库依赖）、`--pin-single` 只钉顶边中点、`--pin-corners` 只钉两角（默认钉整条上边）、`--iters N` `--tol T` `--damping K`。
 窗口内交互：左键拖拽旋转 / 滚轮缩放 / `SPACE` 暂停 / `S` 单步 / `G` 重力 / `R` 重置 /
 `[` `]` 刚度 / `-` `=` 迭代数 / `,` `.` 子步 / `;` `'` 线程数 / `ESC` 退出。
 
-**实测（RTX 4070 Ti 主机，CPU 18 线程）**：60×60 布料（3600 顶点 / 7080 约束），
-vsync 下稳定 **60 FPS**，物理 **1.6–2.1 ms/帧**（PD 迭代 1–2 次即达收敛判据）。
+**实测**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束），`--frames 600` 平均
+**59.4 FPS**（vsync 封顶 60）、稳态物理 **1.52 ms/帧**、迭代 1 次、全程数值分解 1 次。
+开局需要 30–40 次迭代收敛（物理 10–40 ms/帧），约 1 s 后进入稳态。
 
 调试环境变量：
 
@@ -161,9 +184,30 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 
 ---
 
-## 4. 当前状态一句话
+## 4. 当前状态
 
-投影、矩阵装配、pin 处理、自由落体、布料稳定性、预分解复用**都正确**；
-**唯一 NG 是第 3 项**：悬挂弹簧的静止平衡位置（$\ell-mg/\kappa$ vs 正确的 $\ell+mg/\kappa$）。
-相关代码集中在 `core/energy/DistanceTerm.cpp` 的三处方向约定
-与 `core/sim/Integrator.cpp` 第 5 阶段的速度更新。
+**验收 8/8 全过**，另有三组独立验证：
+
+| 验证 | 内容 | 结果 |
+|---|---|---|
+| `pd_check` | 8 项验收 | 全过 |
+| `pd_trans` | 平移一致性：pin 在任意位置下静止位移严格为 0；平移系统后相对形状不变 | 全过 |
+| `pd_chain` | 长链条对照解析解：自由链长度精确不变；悬挂链伸长与 $mg\,N(N-1)/(2\kappa)$ 吻合 | 全过 |
+| `pd_diraudit` | 方向三项：全局一致 / 物理合理 / 与标准 PD 逐位一致 | 全过 |
+| `test_primitives` + `test_spring_vertical` | 68 + 139 断言 | 全绿 |
+
+**实测性能**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束）
+查看器 `--frames 600` 平均 59.4 FPS（vsync 封顶）、稳态物理 1.52 ms/帧，数值分解全程只发生 1 次。
+
+**已知不足**（不是缺陷，是尚未实现）：
+
+1. 材质模型只有 4-邻域距离约束，**没有对角连接、没有弯曲项** —— 四边形可自由剪切成菱形，
+   抗剪切/抗弯不足，折叠与自穿插都无法阻止；
+2. **没有碰撞处理**（IPC 暂缓，见 `docs/design-discussion.md`）；
+3. **刚度标定未最终确定**：$\kappa$ 与顶点质量的量级需按目标网格配好，
+   否则布料在自重下会明显伸长。正确做法是把刚度按质量参数化（$\kappa=k_{\rm mat}\cdot m$），
+   而不是按长度（曾经按 $\mathrm{spacing}^2$ 缩放过，是错的，已撤掉）。
+
+**文档注意**：`README.md` 与 `docs/plan.md` 里关于"重力只出现在预测里"的结论是对的，
+早期文档曾写过"右端要补 $-Mg$"，那**是错的**（等于把重力算两遍），已全部更正。
+若在别处（含 git 历史或 `_verify/` 旧程序的注释）再看到这个说法，以本节为准。
