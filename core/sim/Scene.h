@@ -24,8 +24,31 @@ struct SceneConfig {
 
   // ---- PD 迭代 ----
   int maxIterations = 10;          ///< 每子步最大 PD 迭代数
-  Scalar relTolerance = 1.0e-3;    ///< 相对收敛判据
-  Scalar absTolerance = 1.0e-12;   ///< 绝对收敛判据
+
+  /// 相对收敛判据：`|x^{k+1}-x^k|∞ <= relTolerance · scale`。
+  ///
+  /// **scale 的定义见 Integrator.cpp：它取"本子步已发生的位移量级"**
+  ///   scale = max( max|x̂ - xⁿ|∞ , h²|g| )
+  /// 而不是坐标量级。判据是"本次迭代相对本步已有位移是否可忽略"。
+  ///
+  /// 为什么不用坐标量级（这是本项目修过的一个缺陷）：
+  /// 若写成 `diff <= relTolerance · max|x̂|∞`（坐标量级），则
+  ///   · 放行的单步位移 = relTolerance × 坐标量级，**与刚度无关**；
+  ///   · 高刚度下真实位移远小于这个门槛，第 1 次迭代就判"收敛"退出，
+  ///     留下残差并在后续帧累加，表现为布料缓慢漂移；
+  ///   · 更糟的是**判据不再平移不变**：把同一场景平移到远处，坐标量级变大会
+  ///     让判据突然变松，收敛质量随摆放位置变化。
+  Scalar relTolerance = 1.0e-3;
+
+  /// 绝对收敛判据（单位 m）：单次迭代位移小于它即认为收敛。
+  /// **≤0 表示禁用**（不设单独标志位，就用 "> 0" 判断，避免"传 0 反而恒成立"的坑）。
+  ///
+  /// 注意 1e-12 在 3600 顶点规模下实际不可达，所以真正起作用的是 relTolerance。
+  /// 曾经把它放宽到 1e-6 想让高刚度问题"好转"，那是错的：
+  /// 近静止时 relTolerance·scale ≈ 1e-5 × 6.8e-4 ≈ 6.8e-9 m，比 1e-6 紧约 147 倍，
+  /// 于是绝对判据反而成了**主导**的提前退出条件，把问题掩盖掉而不是解决。
+  /// 收敛不足是外层迭代能力问题，不是门槛松紧问题（见 tests/chain/convergence_criterion.cpp）。
+  Scalar absTolerance = 1.0e-12;
 
   // ---- 规模 ----
   int gridNx = 40;
@@ -61,6 +84,8 @@ struct SimContext {
 
   int factorizeCount = 0;       ///< 实际发生的数值分解次数（测试要断言它）
   int iterationsUsed = 0;       ///< 最近一个子步用掉的 PD 迭代数
+  int earlyExitCount = 0;       ///< 累计"未跑满 maxIterations 就判收敛退出"的子步数
+                                ///< （诊断用：判断收敛判据是否过于宽松的关键指标）
 
   std::vector<Vec3> predicted;  ///< 预测位置 x̂
   std::vector<Vec3> positionsBeforeStep;      ///< 本子步开始时的位置（速度更新用）

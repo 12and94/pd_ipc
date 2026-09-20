@@ -405,6 +405,7 @@ int main(int argc, char** argv) {
   int iters = 40;
   double tol = 1.0e-5;
   double damping = 0.02;
+  bool noEarlyExit = false;   // 关闭全部提前退出，强制每子步跑满 --iters
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -417,13 +418,32 @@ int main(int argc, char** argv) {
     else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (a == "--tol" && i + 1 < argc) tol = std::atof(argv[++i]);
     else if (a == "--damping" && i + 1 < argc) damping = std::atof(argv[++i]);
+    else if (a == "--no-early-exit") noEarlyExit = true;
     else if (a == "--help" || a == "-h") {
-      std::printf("用法: pd_viewer [--grid N] [--frames N] [--shot FILE.png]\n");
+      std::printf(
+          "用法: pd_viewer [--grid N] [--frames N] [--shot FILE.png]\n"
+          "  --grid N          网格边长（默认 60）\n"
+          "  --stiffness K     刚度 κ（默认 1e5）\n"
+          "  --iters N         每子步迭代上限（默认 40）\n"
+          "  --tol T           收敛容差（默认 1e-5）。T=0 等价于 --no-early-exit\n"
+          "  --damping K       速度阻尼 k_d（默认 0.02）\n"
+          "  --no-early-exit   关闭全部提前退出，强制每子步跑满 --iters\n"
+          "  --pin-corners     只钉两个角（默认钉整条上边）\n"
+          "  --pin-single      只钉上边中点\n"
+          "  --frames N        跑够 N 帧后截图并退出\n"
+          "  --shot FILE.png   退出前截图\n");
       return 0;
     }
   }
 
-  std::printf("[参数] grid=%d frames=%d shot=%s\n", gridN, maxFrames, shotPath.c_str());
+  // 容差为 0 视作"关闭全部提前退出"：这样 `--tol 0` 能真正强制跑满迭代数。
+  // （历史缺陷：`--tol 0` 只把相对容差置零，绝对容差仍生效，导致"强制跑满"的
+  //   对照实验实际上仍会提前退出，得出错误结论。)
+  if (tol == 0.0) noEarlyExit = true;
+
+  std::printf("[参数] grid=%d frames=%d shot=%s stiffness=%g iters=%d tol=%g damping=%g%s\n", gridN,
+              maxFrames, shotPath.c_str(), stiffness, iters, tol, damping,
+              noEarlyExit ? " no-early-exit" : "");
 
   // 先建场景（无窗口也能验证物理链路）
   SceneConfig cfg;
@@ -434,7 +454,9 @@ int main(int argc, char** argv) {
   cfg.substepsPerFrame = 2;
   cfg.stiffness = stiffness;
   cfg.maxIterations = iters;
-  cfg.relTolerance = tol;
+  cfg.relTolerance = noEarlyExit ? 0.0 : tol;
+  cfg.absTolerance = noEarlyExit ? 0.0 : cfg.absTolerance;
+  cfg.velocityDamping = damping;  // 历史缺陷：解析了 --damping 却没赋给 cfg，该选项不生效
   SimContext ctx = makeScene(cfg);
 
   // 默认钉住整条上边（只钉两个角时，布料会被拉成尖锥，不是常见演示形态）

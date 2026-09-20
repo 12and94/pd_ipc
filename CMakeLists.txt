@@ -70,6 +70,11 @@ add_executable(test_spring_vertical tests/chain/spring_vertical.cpp)
 target_link_libraries(test_spring_vertical PRIVATE pd_core)
 add_test(NAME spring_vertical COMMAND test_spring_vertical)
 
+# 收敛判据的性质断言（平移不变 / 高刚度不得提前退出）
+add_executable(test_convergence_criterion tests/chain/convergence_criterion.cpp)
+target_link_libraries(test_convergence_criterion PRIVATE pd_core)
+add_test(NAME convergence_criterion COMMAND test_convergence_criterion)
+
 # ---------------------------------------------------------------------------
 add_executable(pd_std_pd _verify/standard_pd.cpp)
 target_link_libraries(pd_std_pd PRIVATE pd_core)

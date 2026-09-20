@@ -147,19 +147,47 @@ int stepOnce(SimContext& ctx) {
     }
     unpackPositions(ctx.xSolution, m.positions);
 
-    // 4e) 收敛判据：相对无穷范数
-    usedIterations = k + 1;
-    Scalar diff = 0.0;
-    Scalar scale = 0.0;
-    for (int v = 0; v < n; ++v) {
-      const std::size_t i = static_cast<std::size_t>(v);
-      diff = std::max(diff, maxAbsComponent(m.positions[i] - previous[i]));
-      scale = std::max(scale, maxAbsComponent(ctx.predicted[i]));
+    // 4e) 收敛判据：以**本子步已发生的位移量级**为参照
+    //
+    //     scale = max( max|x̂ - xⁿ|∞ , h²|g| )
+    //
+    //     语义："本次迭代造成的位移，相对于本步已有的位移是否可忽略"。
+    //
+    //     为什么用位移量级而不是坐标量级（本项目修过的缺陷）：
+    //     原先写作 diff / max|x̂|∞（坐标量级），放行的单步位移
+    //     = relTolerance × 坐标量级，**与刚度无关**。高刚度下真实位移
+    //     （量级 ρgℓ²/κ）远小于该门槛，于是第 1 次迭代就判"收敛"退出：
+    //       · 每次子步留下残差，在后续帧累加 -> 布料缓慢漂移；
+    //       · 判据不再平移不变 —— 同一场景平移到远处，坐标量级变大，
+    //         判据突然变松，收敛质量随摆放位置改变。
+    //     二者都是判据自身的问题，与 PD 算法无关。
+    //
+    //     下限 h²|g| 的作用：完全静止时 x̂ == xⁿ，scale 会退化为 0；
+    //     而即使静止，一个子步内重力也必然要引入 ~h²g 量级的位移，
+    //     用它做下限可避免"除以接近 0 的参照"而永不收敛。
+    {
+      usedIterations = k + 1;
+      Scalar diff = 0.0;
+      Scalar scale = 0.0;
+      for (int v = 0; v < n; ++v) {
+        const std::size_t i = static_cast<std::size_t>(v);
+        diff = std::max(diff, maxAbsComponent(m.positions[i] - previous[i]));
+        scale = std::max(scale, maxAbsComponent(ctx.predicted[i] - ctx.positionsBeforeStep[i]));
+      }
+      scale = std::max(scale, length(cfg.gravity) * h * h);
+      previous = m.positions;
+      const Scalar rel = (scale > 0.0) ? diff / scale : diff;
+      PD_TRACE("迭代 %d: |Δx|∞ = %.6g  相对(本步位移) %.6g  参照 %.6g", usedIterations, diff, rel,
+               scale);
+      // 注意 absTolerance 用 "> 0" 判定禁用：若只写成 diff <= cfg.absTolerance，
+      // 传 0 会因 diff==0 时恒成立而立刻退出（tests/chain 里记录过这个坑）。
+      const bool absHit = (cfg.absTolerance > 0.0) && (diff <= cfg.absTolerance);
+      const bool relHit = (cfg.relTolerance > 0.0) && (rel <= cfg.relTolerance);
+      if (absHit || relHit) {
+        ctx.earlyExitCount += 1;
+        break;
+      }
     }
-    previous = m.positions;
-    const Scalar rel = (scale > 0.0) ? diff / scale : diff;
-    PD_TRACE("迭代 %d: |Δx|∞ = %.6g  相对 %.6g", usedIterations, diff, rel);
-    if (diff <= cfg.absTolerance || rel <= cfg.relTolerance) break;
   }
   ctx.iterationsUsed = usedIterations;
 
