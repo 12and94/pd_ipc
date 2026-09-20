@@ -30,26 +30,31 @@ SolverStamp computeStamp(const Mesh& mesh, Scalar dt, Scalar damping, uint64_t t
   SolverStamp s;
   s.topologyId = topologyId;
   s.dtBits = bitsOf(dt);
-  s.dampingBits = bitsOf(damping);  // 阻尼进入有效质量，故也是失效条件之一
 
   uint64_t stiffnessHash = 0xcbf29ce484222325ULL;
   uint64_t massHash = 0xcbf29ce484222325ULL;
   for (const auto& e : mesh.edges) stiffnessHash = mix(stiffnessHash, bitsOf(e.stiffness));
   for (Scalar m : mesh.masses) massHash = mix(massHash, bitsOf(m));
 
-  uint64_t pinHash = 0xcbf29ce484222325ULL;
+  // pin **掩码**：只有"哪些顶点被 pin"会改变 L。
+  // 被 pin 的行被覆盖为 (对角 1, 右端 q)，对角值与 q 无关；约束块只看端点是否被 pin。
+  // 所以 pinPositions 的数值**不进 stamp**——否则拖拽把手（只改 b）会触发一次
+  // 毫无必要的数值重分解，而 docs/plan.md §2.2.1 明确要求"移动把手不触发重分解"。
+  // 注意这里不能对 pinned 顶点取"位置相关"的哈希：掩码是拓扑性质的量。
+  uint64_t pinMask = 0xcbf29ce484222325ULL;
   for (std::size_t v = 0; v < mesh.pinned.size(); ++v) {
-    if (mesh.pinned[v]) {
-      pinHash = mix(pinHash, static_cast<uint64_t>(v));
-      pinHash = mix(pinHash, bitsOf(mesh.pinPositions[v].x));
-      pinHash = mix(pinHash, bitsOf(mesh.pinPositions[v].y));
-      pinHash = mix(pinHash, bitsOf(mesh.pinPositions[v].z));
-    }
+    pinMask = mix(pinMask, mesh.pinned[v] ? 1ULL : 0ULL);
   }
 
   s.stiffnessBits = stiffnessHash;
   s.massBits = massHash;
-  s.pinBits = pinHash;
+  s.pinBits = pinMask;
+
+  // 阻尼不进 L：L 的惯性项是未缩放的 M/h²，阻尼只体现在速度更新
+  // v_{n+1} = (1-k_d)(x_{n+1}-x_n)/h 上（见 Integrator.cpp 第 5 步）。
+  // 因此改阻尼只需要重算右端，不该触发重分解。dampingBits 仍按位记录，
+  // 供上层诊断/回归对比使用，但不参与"是否需要重分解"的判定。
+  s.dampingBits = bitsOf(damping);
   return s;
 }
 
@@ -57,11 +62,9 @@ void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
                           Eigen::SparseMatrix<Scalar>& L) {
   const int n = mesh.vertexCount();
   const int dim = 3 * n;
-  // 带阻尼的有效质量：M_γ = M/(1-k_d)。
-  // 与 Integrator 里 v_{n+1} = (1-k_d)(x_{n+1}-x_n)/h 配对，
-  // 才等价于"带集中阻尼的隐式欧拉"（详见 Integrator.cpp 第 5 步的说明）。
-  // 惯性项用 M/h²：阻尼由 Integrator 里 v_{n+1}=(1-k_d)[v_n+Δx/h] 的 v_n 项体现，
-  // 不需要（也不应该）在这里缩放有效质量。
+  // 惯性项用**未缩放**的 M/h²。damping 参数在这里刻意不使用：
+  // 阻尼只体现在 Integrator 的速度更新 v_{n+1} = (1-k_d)(x_{n+1}-x_n)/h 上，
+  // 不改变 L 的数值 —— 这也正是"改阻尼不需要重分解"的原因（见 computeStamp）。
   const Scalar invDt2 = 1.0 / (dt * dt);
 
   std::vector<Eigen::Triplet<Scalar>> triplets;
@@ -119,24 +122,21 @@ void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
 void assembleInertialRhs(const Mesh& mesh, const std::vector<Vec3>& predicted, Scalar dt,
                          Scalar damping, Eigen::VectorXd& b) {
   const int n = mesh.vertexCount();
-  // 带阻尼的有效质量：M_γ = M/(1-k_d)。
-  // 与 Integrator 里 v_{n+1} = (1-k_d)(x_{n+1}-x_n)/h 配对，
-  // 才等价于"带集中阻尼的隐式欧拉"（详见 Integrator.cpp 第 5 步的说明）。
-  // 惯性项用 M/h²：阻尼由 Integrator 里 v_{n+1}=(1-k_d)[v_n+Δx/h] 的 v_n 项体现，
-  // 不需要（也不应该）在这里缩放有效质量。
+  // damping 参数同样不在这里使用：有效质量不做任何缩放，惯性项就是 M/h²
+  // （阻尼由 Integrator 的速度更新承担，见上）。
   const Scalar invDt2 = 1.0 / (dt * dt);
   b.resize(3 * n);
 
-  // 右端 = (M_γ/h²)·x̂      —— 只有这一项。
+  // 右端 = (M/h²)·x̂      —— 只有这一项。
   //
   // **重力不在这里出现**：它已经包含在预测位置 x̂ = x + h v + h² g 里面，
   // 而且只能出现这一次。若在右端再补一项 -M g，等于把重力算了两遍，
   // 静止条件会从 κ(x-ℓ) = m g 变成 κ(x-ℓ) = 0，平衡位置随之退到 x = ℓ。
   // （本项目在排查符号问题的过程中犯过这个错，特此记录。）
   //
-  // 标准 PD 的增量势能：g(x) = 1/(2h²)‖x-x̂‖²_{M_γ} + Ψ(x)，
-  //   ∇g = (M_γ/h²)(x - x̂) + ∇Ψ = 0
-  //   ⇒ L x = (M_γ/h²) x̂ + Σ_c κ_c A_cᵀ d_c
+  // 标准 PD 的增量势能：g(x) = 1/(2h²)‖x-x̂‖²_M + Ψ(x)，
+  //   ∇g = (M/h²)(x - x̂) + ∇Ψ = 0
+  //   ⇒ L x = (M/h²) x̂ + Σ_c κ_c A_cᵀ d_c
   // 重力势能 -M g·x 的作用已经通过 x̂ 里的 +h²g 体现（这正是 x̂ 的来历）。
   for (int v = 0; v < n; ++v) {
     const std::size_t i = static_cast<std::size_t>(v);

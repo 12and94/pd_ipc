@@ -94,9 +94,9 @@ TEST(gradientMatchesFiniteDifference) {
 }
 
 // ---------------------------------------------------------------------------
-// 3) 装配系数：右端必须是 2κ d，矩阵块必须是 ±κ I
-//    系数 2 来自 prox 的定义（见 docs/plan.md §2.2.1）；漏掉它会让等效刚度减半，
-//    而且是一个"静默"错误 —— 所以这里逐元素断言。
+// 3) 装配系数：右端必须是 κ_c d_c（再加 pin 消元补偿 κ_c q），矩阵块必须是 ±κ_c I。
+//    两处各写一份 κ_c、必须同源同一个 A_c：多写或少写都会"静默"改变等效刚度，
+//    所以这里逐元素断言。
 // ---------------------------------------------------------------------------
 TEST(scatterUsesStandardPdSign) {
   Mesh m;
@@ -129,6 +129,90 @@ TEST(scatterUsesStandardPdSign) {
   CHECK(b[0] == 0.0 && b[2] == 0.0 && b[3] == 0.0 && b[5] == 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// 3b) pin 消元补偿：只有一端被 pin 时，自由端的右端要多一项 +κ_c·q。
+//
+//     为什么必然有这一项：被 pin 的那一行会被 applyPinRhs 整行覆盖成 (对角 1, 右端 q)，
+//     这等于把该自由度从方程组里消去；但它在耦合块里原本贡献的 -κ·x_pin 是挂在
+//     **自由端那一行**上的，行被覆盖并不会顺手把它处理掉，必须显式搬到自由端右端：
+//
+//         (m/h² + κ)·x_free = (m/h²)·x̂_free + κ·d_c + κ·q
+//
+//     漏掉 κ·q 的后果是自由端丢失 pinned 点的位置信息：整个系统被拉向原点，
+//     平移场景会改变结果（无重力、本来就在静止长度时也会自行变形）。
+//     这是一个"看起来只是差一点"的静默错误，所以逐分量断言。
+// ---------------------------------------------------------------------------
+TEST(pinEliminationAddsKappaTimesPinPosition) {
+  const Scalar k = 300.0, rest = 0.1;
+
+  // (a) 顶点 a 被 pin、b 自由：b 的右端应恰好多出 κ·q_a。
+  //     位形刻意取与 q_a 无关的任意值，确保断言抓的是 q_a 而不是当前位置。
+  {
+    Mesh m;
+    m.positions = {Vec3{0.7, -0.2, 0.3}, Vec3{2.0, 1.0, -4.0}};  // 顶点 1 当前在别处
+    m.restPositions = {Vec3{0, 0, 0}, Vec3{0, rest, 0}};
+    m.velocities = {Vec3{}, Vec3{}};
+    m.masses = {0.1, 0.1};
+    m.pinned = {0, 1};
+    m.pinPositions = {Vec3{0, 0, 0}, Vec3{2.0, 1.0, -4.0}};  // q_b = 顶点 1 的 pin 位置
+    m.edges.push_back(Edge{0, 1, rest, k});
+
+    std::vector<Vec3> targets;
+    DistanceTerm::project(m, targets);
+    std::vector<Scalar> b(6, 0.0);
+    DistanceTerm::scatterInto(m, targets, b.data(), b.size());
+
+    // 自由端 b 的期望：-κ·d_c（散射） + κ·q_a（消元补偿）；pin 端不进 b。
+    const Vec3 want = targets[0] * k + m.pinPositions[1] * k;
+    CHECK_NEAR(b[0], want.x, 1e-12);
+    CHECK_NEAR(b[1], want.y, 1e-12);
+    CHECK_NEAR(b[2], want.z, 1e-12);
+    CHECK(b[3] == 0.0 && b[4] == 0.0 && b[5] == 0.0);
+  }
+
+  // (b) 顶点 b 被 pin、a 自由：补偿项同样落在自由端 a 上（另一个分支）。
+  {
+    Mesh m;
+    m.positions = {Vec3{-1.5, 0.4, 0.25}, Vec3{0, rest, 0}};
+    m.restPositions = {Vec3{0, 0, 0}, Vec3{0, rest, 0}};
+    m.velocities = {Vec3{}, Vec3{}};
+    m.masses = {0.1, 0.1};
+    m.pinned = {1, 0};
+    m.pinPositions = {Vec3{-1.5, 0.4, 0.25}, Vec3{0, 0, 0}};
+    m.edges.push_back(Edge{0, 1, rest, k});
+
+    std::vector<Vec3> targets;
+    DistanceTerm::project(m, targets);
+    std::vector<Scalar> b(6, 0.0);
+    DistanceTerm::scatterInto(m, targets, b.data(), b.size());
+
+    // 自由端 a 的期望：+κ·d_c（散射） + κ·q_b（消元补偿）；pin 端不进 b。
+    const Vec3 want = targets[0] * (-k) + m.pinPositions[0] * k;
+    CHECK_NEAR(b[3], want.x, 1e-12);
+    CHECK_NEAR(b[4], want.y, 1e-12);
+    CHECK_NEAR(b[5], want.z, 1e-12);
+    CHECK(b[0] == 0.0 && b[1] == 0.0 && b[2] == 0.0);
+  }
+
+  // (c) 两端都 pin：整条约束被跳过，右端保持全零。
+  {
+    Mesh m;
+    m.positions = {Vec3{0, 0, 0}, Vec3{0, 2 * rest, 0}};
+    m.restPositions = m.positions;
+    m.velocities = {Vec3{}, Vec3{}};
+    m.masses = {0.1, 0.1};
+    m.pinned = {1, 1};
+    m.pinPositions = m.positions;
+    m.edges.push_back(Edge{0, 1, rest, k});
+
+    std::vector<Vec3> targets;
+    DistanceTerm::project(m, targets);
+    std::vector<Scalar> b(6, 0.0);
+    DistanceTerm::scatterInto(m, targets, b.data(), b.size());
+    for (int i = 0; i < 6; ++i) CHECK(b[i] == 0.0);
+  }
+}
+
 TEST(assembledMatrixHasConstantBlocks) {
   Mesh m;
   m.positions = {Vec3{0, 0, 0}, Vec3{0.123, 0.3, -0.05}};  // 任意位形
@@ -146,7 +230,7 @@ TEST(assembledMatrixHasConstantBlocks) {
   assembleLeftHandSide(m, dt, 0.0, L);
 
   // 标准 PD：L = M/h² + Σ κ A_cᵀA_c
-  //   对角块 +κ I，耦合块 -κ I，惯性项用未缩放的 M/h²（阻尼为 0 时 M_γ = M）。
+  //   对角块 +κ I，耦合块 -κ I，惯性项用**未缩放**的 M/h²（阻尼不进入 L）。
   CHECK_NEAR(L.coeff(0, 0), m.masses[0] / (dt * dt) + k, 1e-9);
   CHECK_NEAR(L.coeff(4, 4), m.masses[1] / (dt * dt) + k, 1e-9);
   // 非对角块：-κ I
@@ -184,6 +268,73 @@ TEST(pinnedRowIsExactIdentityRow) {
   // 双向耦合项因为有一端被 pin 而消失（那一行被整行覆盖）。
   CHECK_NEAR(L.coeff(4, 1), 0.0, 1e-15);
   CHECK_NEAR(L.coeff(1, 4), 0.0, 1e-15);
+}
+
+// ---------------------------------------------------------------------------
+// 3c) SolverStamp 的语义：只包含"真的会改变 L 的数值"的量。
+//
+//     判据来自 L 的构造（见 Assembler.cpp assembleLeftHandSide）：
+//       · 惯性对角      M/h²              → 依赖质量、h
+//       · 约束块        κ_c A_cᵀA_c       → 依赖刚度
+//       · pinned 行     覆盖为 (对角 1, 右端 q) → 只依赖**哪些**顶点被 pin，不依赖 q
+//       · 阻尼          不出现            → 不进 L
+//
+//     多放一项的后果是"白做一次数值分解"：拖拽把手或拖动阻尼滑块时会重分解，
+//     而那是交互里每帧都在发生的事，直接吃帧预算（且与 docs/plan.md §2.2.1
+//     "移动把手不触发重分解"的约定矛盾）。
+// ---------------------------------------------------------------------------
+TEST(stampChangesOnlyWhenLeftHandSideValuesChange) {
+  Mesh m;
+  m.positions = {Vec3{0, 0, 0}, Vec3{0.4, 0.1, 0.0}};
+  m.restPositions = m.positions;
+  m.velocities = {Vec3{}, Vec3{}};
+  m.masses = {0.1, 0.1};
+  m.pinned = {1, 0};
+  m.pinPositions = m.positions;
+  m.edges.push_back(Edge{0, 1, 0.1, 400.0});
+
+  const Scalar dt = 1.0 / 120.0;
+  const SolverStamp base = computeStamp(m, dt, 0.0, 1);
+
+  // (a) 拖拽把手：只改 pinPositions，L 的数值不变 ⇒ stamp 必须不变。
+  m.pinPositions[0] = Vec3{0.7, -0.3, 2.0};
+  CHECK_MSG(computeStamp(m, dt, 0.0, 1) == base,
+            "拖动 pin 只影响右端 b，不应触发重分解");
+
+  // (b) 改阻尼：L 不含阻尼（只影响速度更新）⇒ stamp 必须不变。
+  CHECK_MSG(computeStamp(m, dt, 0.35, 1) == base, "阻尼不进入 L，不应触发重分解");
+
+  // (c) 改 pin 掩码：被覆盖的行变了 ⇒ stamp 必须变。
+  m.pinned[1] = 1;
+  CHECK_MSG(computeStamp(m, dt, 0.0, 1) != base, "pin 掩码改变必须触发重分解");
+  m.pinned[1] = 0;
+
+  // (d) 改刚度、质量、h、拓扑：都进 L ⇒ stamp 必须变。
+  m.edges[0].stiffness = 401.0;
+  CHECK_MSG(computeStamp(m, dt, 0.0, 1) != base, "刚度改变必须触发重分解");
+  m.edges[0].stiffness = 400.0;
+
+  m.masses[1] = 0.1000001;
+  CHECK_MSG(computeStamp(m, dt, 0.0, 1) != base, "质量改变必须触发重分解");
+  m.masses[1] = 0.1;
+
+  CHECK_MSG(computeStamp(m, dt * 0.5, 0.0, 1) != base, "子步长 h 改变必须触发重分解");
+  CHECK_MSG(computeStamp(m, dt, 0.0, 2) != base, "拓扑标识改变必须触发重分解");
+
+  // (e) 反证："不重分解"必须真的是对的 —— 把 pin 从原点挪到别处，
+  //     组装出的 L 必须逐元素相同（pinned 行恒为对角 1、其余 0）。
+  Eigen::SparseMatrix<Scalar> l1, l2;
+  assembleLeftHandSide(m, dt, 0.0, l1);
+  m.pinPositions[0] = Vec3{-3.0, 1.5, 0.25};
+  assembleLeftHandSide(m, dt, 0.25, l2);
+  CHECK(l1.rows() == l2.rows() && l1.cols() == l2.cols());
+  bool identical = true;
+  for (int k = 0; k < l1.outerSize() && identical; ++k) {
+    for (Eigen::SparseMatrix<Scalar>::InnerIterator it(l1, k); it; ++it) {
+      if (it.value() != l2.coeff(it.row(), it.col())) identical = false;
+    }
+  }
+  CHECK_MSG(identical, "改 pin 位置或阻尼后 L 必须逐位不变（这是「不重分解」的依据）");
 }
 
 // ---------------------------------------------------------------------------

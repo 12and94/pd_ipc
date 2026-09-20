@@ -10,7 +10,8 @@
 //
 // 全局步的矩阵块是**常数**（与位形无关）：
 //   L_aa += κ_c I,  L_bb += κ_c I,  L_ab -= κ_c I,  L_ba -= κ_c I
-// 右端的散射量是 2 κ_c d_c（系数 2 来自 prox 的定义，见文档 §2.2.1 的说明）。
+// 右端的散射量是 κ_c d_c：b_a += κ_c d_c，b_b -= κ_c d_c。
+// （矩阵块与散射必须同源同一个 A_c；两处各写一份 κ_c，没有额外的系数 2。）
 #pragma once
 
 #include <vector>
@@ -34,9 +35,14 @@ class DistanceTerm {
   /// 单条约束的投影（供原语测试直接调用）。
   static Vec3 projectOne(const Vec3& pa, const Vec3& pb, Scalar restLength);
 
-  /// 把 2 κ_c d_c 散射进右端。b 指向长度 3*vertexCount 的连续缓冲（按 [x,y,z] 存放）。
+  /// 把 κ_c d_c 散射进右端（含 pin 消元补偿，见 .cpp 内的推导）。
+  /// b 指向长度 3*vertexCount 的连续缓冲（按 [x,y,z] 存放）。
   /// 用裸指针而不是 Eigen 类型，是为了让 GPU 后端也能共用同一份语义。
   /// 内部使用"线程私有缓冲 + 固定顺序归约"，不做浮点原子加（决策 D6）。
+  ///
+  /// 前置条件：若 mesh 里有 pinned 顶点，`mesh.pinPositions` 必须已按顶点数填充
+  /// （正常流程由 makeScene / refreshPinPositions 保证）。违反时本函数会立即
+  /// 报错退出，而不是靠越界读把问题变成难以定位的崩溃。
   static void scatterInto(const Mesh& mesh, const std::vector<Vec3>& targets, Scalar* b,
                           std::size_t dim);
 

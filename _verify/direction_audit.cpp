@@ -29,6 +29,12 @@ void item(const char* name, bool ok, const char* detail = "") {
   if (!ok) ++gFail;
 }
 
+/// 手工搭建 Mesh 时必须显式满足的前置条件：
+/// 一旦有 pinned 顶点，散射阶段要用 pinPositions[pin] 做消元补偿（b_free += κ·q）。
+/// 正常流程由 makeScene / refreshPinPositions 填充；这里是手搭的，就自己对齐一次。
+/// （漏掉它以前会越界读到崩溃；现在 core 里会直接报错并停下。）
+void syncPinPositions(Mesh& m) { m.pinPositions = m.positions; }
+
 const Scalar kEll = 0.1;
 const Scalar kK = 1.0e4;
 
@@ -107,6 +113,7 @@ int main() {
         Mesh m;
         m.positions = {Vec3{0, 0, 0}, Vec3{0, y, 0}};
         m.pinned = {1, 0};
+        syncPinPositions(m);
         m.edges.push_back(Edge{0, 1, kEll, kK});
         std::vector<Vec3> t;
         DistanceTerm::project(m, t);
@@ -123,6 +130,7 @@ int main() {
         Mesh m;
         m.positions = {Vec3{0, y, 0}, Vec3{0, 0, 0}};
         m.pinned = {0, 1};
+        syncPinPositions(m);
         m.edges.push_back(Edge{0, 1, kEll, kK});
         std::vector<Vec3> t;
         DistanceTerm::project(m, t);
@@ -150,6 +158,7 @@ int main() {
       Mesh m;
       m.positions = {xa, xb};
       m.pinned = {0, 0};
+      syncPinPositions(m);
       m.edges.push_back(Edge{0, 1, kEll, kK});
       std::vector<Vec3> t;
       DistanceTerm::project(m, t);

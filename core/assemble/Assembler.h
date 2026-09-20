@@ -21,14 +21,15 @@ namespace pd {
 /// 计算触发重新分解的判定戳。只做精确值比较，不做容差比较。
 SolverStamp computeStamp(const Mesh& mesh, Scalar dt, Scalar damping, uint64_t topologyId);
 
-/// 组装 L 的数值部分：M_γ/h² + Σ_c κ_c A_cᵀ A_c，并覆盖 pinned 行。
-/// 其中 M_γ = M/(1-k_d) 是"带阻尼的有效质量"（见 Integrator.cpp 第 5 步说明）。
+/// 组装 L 的数值部分：M/h² + Σ_c κ_c A_cᵀ A_c，并覆盖 pinned 行。
+/// 惯性项是**未缩放**的 M/h²；阻尼不进入 L（它只影响速度更新，见 Integrator.cpp 第 5 步）。
 /// 只在 stamp 变化时调用（正常运行时每帧不调用）。
 void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
                           Eigen::SparseMatrix<Scalar>& L);
 
-/// 组装右端的惯性部分：b = (M_γ/h²)·x̂。
-/// 重力**不在这里**：它只出现在预测位置 x̂ = x + hv + h²g 里（只出现一次）。
+/// 组装右端的惯性部分：b = (M/h²)·x̂（**只有这一项**）。
+/// 重力**不在这里**：它只出现在预测位置 x̂ = x + hv + h²g 里（只出现一次，
+/// 再补一项 -Mg 就是重复计入）。
 void assembleInertialRhs(const Mesh& mesh, const std::vector<Vec3>& predicted,
                          Scalar dt, Scalar damping, Eigen::VectorXd& b);
 

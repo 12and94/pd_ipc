@@ -57,6 +57,26 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
                                std::size_t dim) {
   const int ne = mesh.edgeCount();
 
+  // ---- 前置条件检查（快速失败）----
+  // 散射在两端只有一端被 pin 时要读 mesh.pinPositions[*] 做消元补偿。
+  // 该缓冲的填充由调用方负责（Scene 的 makeScene / refreshPinPositions）。
+  // 手工搭 Mesh 的调用方（测试、_verify 程序）很容易只写 pinned 而漏掉 pinPositions；
+  // 那时越界读会表现为随机崩溃（0xC0000005），极难定位，所以这里直接查出来并停下。
+  if (mesh.pinPositions.size() < mesh.positions.size()) {
+    bool anyPinned = false;
+    for (int v = 0; v < mesh.vertexCount() && !anyPinned; ++v) anyPinned = mesh.isPinned(v);
+    if (anyPinned) {
+      std::fprintf(stderr,
+                   "[DistanceTerm::scatterInto] 违反前置条件：mesh 存在 pinned 顶点，但 "
+                   "pinPositions 只有 %zu 项（顶点数 %zu）。\n"
+                   "  pin 消元补偿需要 b_free += κ·q 里那个 q = pinPositions[pin 顶点]。\n"
+                   "  正常流程由 makeScene / refreshPinPositions 填充；手工搭 Mesh 时请显式设置，\n"
+                   "  或在设置 pinned 后把 pinPositions 同步为当前位置。\n",
+                   mesh.pinPositions.size(), mesh.positions.size());
+      std::fflush(stderr);
+      std::abort();
+    }
+  }
 
   // 每线程私有缓冲 + 固定顺序归约：结果与线程数无关（可复现）。
   // 首期刻意不用浮点原子加，见 docs/plan.md 决策 D6。
@@ -65,13 +85,10 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
 
   const int nThreads = buffers.threadCount();
 
-
   if (nThreads <= 1 || ne < 256) {
     for (int c = 0; c < ne; ++c) {
       const Edge& e = mesh.edges[static_cast<std::size_t>(c)];
-      // 散射项取 -κ_c d_c：与矩阵对角块 -κ_c I 配对（见 assembleMatrix 的符号说明）。
-      // 配错符号会让弹簧力整体反号，稳态跑到 ℓ - m g/κ —— 这是实测确认过的。
-            // 散射项 -κ_c d_c：与对角块 +κ u uᵀ、耦合块 -κ u uᵀ 配对。
+      // 散射项 κ_c d_c：与对角块 +κ_c I、耦合块 -κ_c I 配对。
       // 配错符号会让弹簧力整体反号（稳态跑到 ℓ - m g/κ）。
       const Vec3 contribution = targets[static_cast<std::size_t>(c)] * e.stiffness;
 
@@ -175,9 +192,9 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
     const bool aPinned = mesh.isPinned(e.a);
     const bool bPinned = mesh.isPinned(e.b);
     if (aPinned && bPinned) continue;
-          // 散射项 -κ_c d_c：与对角块 +κ u uᵀ、耦合块 -κ u uᵀ 配对。
-      // 配错符号会让弹簧力整体反号（稳态跑到 ℓ - m g/κ）。
-      const Vec3 contribution = targets[static_cast<std::size_t>(c)] * e.stiffness;
+    // 散射项 κ_c d_c：与对角块 +κ_c I、耦合块 -κ_c I 配对。
+    // 配错符号会让弹簧力整体反号（稳态跑到 ℓ - m g/κ）。
+    const Vec3 contribution = targets[static_cast<std::size_t>(c)] * e.stiffness;
     const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
     const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
     if (!aPinned) {

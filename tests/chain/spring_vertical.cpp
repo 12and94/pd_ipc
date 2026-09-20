@@ -143,7 +143,7 @@ TEST(iterationCountDoesNotChangeFixedPoint) {
 }
 
 // ---------------------------------------------------------------------------
-// 3) 离散平衡位置：静止后的位置必须收敛到 ℓ + m g/κ（质量挂在静止长度**下方**）
+// 3) 离散平衡位置：静止后的位置必须收敛到 ℓ - m g/κ（质量挂在静止长度**下方**）
 //
 //    平衡位置由**能量极小值**决定，不能靠"力朝哪边"的直觉判断：
 //      E(y) = (κ/2)(y-ℓ)² + m·g·y        （重力向量 g_vec = (0,-g,0)，g 为大小）
@@ -291,6 +291,83 @@ TEST(energyStaysBounded) {
   // 允许隐式欧拉的轻微数值耗散，但不允许增长。
   CHECK_LE(worst, e0 * (1.0 + 1e-9));
   CHECK(std::isfinite(worst));
+}
+
+// ---------------------------------------------------------------------------
+// 7) 分解复用不变量（docs/plan.md §2.3 不变量 1/2）：
+//    · 一个时间步内的 K 次 PD 迭代：L 不重组、不重分解（每迭代只换右端 b）
+//    · 跨帧：只要拓扑/刚度/质量/h/pin 掩码不变，就**一次都不能**再分解
+//    · 反向：改刚度、换 h、改 pin 掩码后，必须**恰好**多一次分解
+//
+//    这条是方向 1 实时性的全部依据，也是最容易被"顺手加一个失效条件"破坏的地方
+//    （它破坏时结果依然正确，只是白做分解 —— 没有断言就没人会发现）。
+// ---------------------------------------------------------------------------
+TEST(globalMatrixIsFactoredOnceAndReused) {
+  const Scalar mass = 0.05, restLength = 0.1, k = 1.0e4, h = 1.0 / 120.0;
+  SimContext ctx = makeTwoVertexSpring(0.12, 0.0, mass, restLength, k, h);
+  ctx.config.maxIterations = 40;
+
+  const int solvesAtStart = ctx.solver->stats().solveCalls;
+  stepOnce(ctx);  // 第一次调用内部完成"组装 + 符号分解 + 数值分解"
+  CHECK(ctx.factorizeCount == 1);
+  CHECK(ctx.solver->stats().analyzeCalls == 1);
+  const int solvesInFirstStep = ctx.solver->stats().solveCalls - solvesAtStart;
+  // 首次迭代必须至少解一次；单弹簧的性质是"一次迭代即到不动点"，故通常恰好 2 次
+  // （第 2 次用来把收敛残差压到判据以下）。这里只断言下界，不锁死实现细节。
+  CHECK_MSG(solvesInFirstStep >= 1, "一个时间步内至少要有一次全局回代");
+
+  // 关键断言：每次 PD 迭代都必须回代，但**全局步次数不得影响分解次数**。
+  // 用两个只有 maxIterations 不同的场景跑同样步数，分解次数必须都为 1。
+  {
+    SimContext many = makeTwoVertexSpring(0.12, 0.0, mass, restLength, k, h);
+    many.config.maxIterations = 1;  // 每步只允许 1 次迭代
+    for (int s = 0; s < 2000; ++s) stepOnce(many);
+    CHECK_MSG(many.factorizeCount == 1, "maxIterations=1、2000 步：仍只允许一次分解");
+
+    SimContext few = makeTwoVertexSpring(0.12, 0.0, mass, restLength, k, h);
+    few.config.maxIterations = 40;
+    for (int s = 0; s < 2000; ++s) stepOnce(few);
+    CHECK_MSG(few.factorizeCount == 1, "maxIterations=40、2000 步：仍只允许一次分解");
+    CHECK(few.solver->stats().analyzeCalls == 1);
+    CHECK_MSG(few.solver->stats().solveCalls >= many.solver->stats().solveCalls,
+              "迭代上限更高的场景，回代次数不应更少");
+  }
+
+  // 上述 2000 步应当已经走到能量极小值 ℓ - m g/κ（顺带再钉一次平衡，且证明
+  // 分解复用没有污染解）。
+  for (int s = 0; s < 2000; ++s) stepOnce(ctx);
+  CHECK(ctx.factorizeCount == 1);
+  CHECK(ctx.solver->stats().analyzeCalls == 1);
+  CHECK_LE(std::fabs(ctx.mesh.positions[1].y - (restLength - mass * 9.81 / k)) / restLength,
+           1e-6);
+
+  // 反向 1：改刚度 → 必须恰好一次新分解（L 的约束块变了）。
+  ctx.config.stiffness = k * 2.0;
+  for (auto& e : ctx.mesh.edges) e.stiffness = k * 2.0;
+  stepOnce(ctx);
+  CHECK_MSG(ctx.factorizeCount == 2, "改刚度必须触发一次重分解");
+
+  // 反向 2：换子步长 h → 必须再分解一次（h 进入 M/h²）。
+  ctx.config.dt = h * 0.5;
+  stepOnce(ctx);
+  CHECK_MSG(ctx.factorizeCount == 3, "换子步长 h 必须触发一次重分解");
+
+  // 反向 3：改 pin 掩码 → 必须再分解一次（被覆盖的行变了）。
+  // 注意只改 pin **位置**（拖拽把手）不该触发重分解，那由 primitives 的
+  // stampChangesOnlyWhenLeftHandSideValuesChange 断言。
+  ctx.mesh.pinned[1] = 1;
+  ctx.mesh.pinPositions[1] = ctx.mesh.positions[1];
+  stepOnce(ctx);
+  CHECK_MSG(ctx.factorizeCount == 4, "改 pin 掩码必须触发一次重分解");
+
+  // 反向 4（关键）：改 pin 位置与阻尼**不得**触发重分解。
+  const int before = ctx.factorizeCount;
+  ctx.mesh.pinPositions[0] = Vec3{1.0, -0.5, 0.25};
+  ctx.config.velocityDamping = 0.3;
+  for (int s = 0; s < 100; ++s) stepOnce(ctx);
+  CHECK_MSG(ctx.factorizeCount == before,
+            "拖拽把手 / 改阻尼不改变 L，不允许重分解");
+  CHECK(std::isfinite(ctx.mesh.positions[0].y));
 }
 
 TEST_MAIN("chain/spring_vertical")

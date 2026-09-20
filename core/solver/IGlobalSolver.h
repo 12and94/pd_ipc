@@ -20,18 +20,24 @@ namespace pd {
 /// 触发重新数值分解的条件集合。
 /// L 的数值只依赖这些量（与位形无关），因此可以用"逐字段精确比较"判断是否需要重分解：
 /// 相比浮点容差比较，精确比较不会因为"几乎没变"而误判，语义也更明确。
+///
+/// **判据原则：只放"真的会改变 L 的数值"的量。**
+/// 多放一项的代价是每次变动都白做一次数值分解（拖动滑块时会卡帧）；
+/// 少放一项的代价是矩阵过期、解错误且不报错。因此每个字段都要能说清它改的是
+/// L 的哪一部分（见 Assembler.cpp `computeStamp` 的逐项说明）。
 struct SolverStamp {
-  uint64_t topologyId = 0;      ///< 拓扑标识（顶点数、边数、结构版本）
-  uint64_t stiffnessBits = 0;   ///< 刚度集合的位模式哈希（Σ κ_c 的精确位）
-  uint64_t massBits = 0;        ///< 质量集合的位模式哈希
+  uint64_t topologyId = 0;      ///< 拓扑标识（顶点数、边数、结构版本）→ 决定稀疏结构
+  uint64_t stiffnessBits = 0;   ///< 刚度集合的位模式哈希（进入约束块 κ_c A_cᵀA_c）
+  uint64_t massBits = 0;        ///< 质量集合的位模式哈希（进入惯性对角 M/h²）
   uint64_t dtBits = 0;          ///< 子步长 h 的位模式（h 进入 M/h²）
-  uint64_t pinBits = 0;         ///< pin 掩码哈希
-  uint64_t dampingBits = 0;     ///< 阻尼系数的位模式（阻尼进入有效质量 M/(1-k_d)）
+  uint64_t pinBits = 0;         ///< pin **掩码**哈希（决定哪些行被覆盖、哪些约束块被跳过）
+  uint64_t dampingBits = 0;     ///< 阻尼系数的位模式。**仅为诊断记录，不参与 == 比较**：
+                                ///< 阻尼只影响速度更新（右端/时间推进），不影响 L。
 
   bool operator==(const SolverStamp& o) const {
+    // 注意：dampingBits 刻意不参与比较（它不影响 L）。
     return topologyId == o.topologyId && stiffnessBits == o.stiffnessBits &&
-           massBits == o.massBits && dtBits == o.dtBits && pinBits == o.pinBits &&
-           dampingBits == o.dampingBits;
+           massBits == o.massBits && dtBits == o.dtBits && pinBits == o.pinBits;
   }
   bool operator!=(const SolverStamp& o) const { return !(*this == o); }
 };
