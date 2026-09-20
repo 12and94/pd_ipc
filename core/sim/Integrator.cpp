@@ -65,20 +65,25 @@ Scalar nonlinearResidual(const SimContext& ctx) {
   const int n = m.vertexCount();
   const Scalar invH2 = 1.0 / (ctx.config.dt * ctx.config.dt);
 
-  // 约束力的正确形式：f^int = κ(AᵀA x − Aᵀ d) —— **两部分都要**。
-  //   推导：真实弹性力 κ(r−ℓ)·unit(x_a−x_b) = κA x − κ ℓ·unit = κA x − κ d_c
-  //   按顶点 a、b 展开后，a 端得 +κ(x_a−x_b) − κ d_c，b 端得 −κ(x_a−x_b) + κ d_c。
-  //   **只取 κd_c 一侧是错的**（那是散射项，不是力）：本项目实测只取 κd_c 时
-  //   残差为 7.07e6 m/s²，而应变 1e-4 的弹簧其力只有 0.2 N 量级 —— 差了 4 个数量级。
-  //   原因：x = x̂、v = 0 时 κAᵀA x 与 κAᵀd 各自都是 O(κℓ)，只有两者之差才是 O(κ(r−ℓ))。
+  // 约束力的正确形式：f^int = κ(AᵀA x − Aᵀ d)，其中 d 必须是**当前位置**的投影。
+  //
+  // **这里踩过一个坑（务必保留说明）**：最初版本直接用了 `ctx.targets`，但那是
+  // `stepOnce` 迭代循环**最后一次迭代开始前**算的投影。一旦循环提前退出
+  // （位移/残差判据命中），targets 相对当前位置就**过期**了：此时
+  //     |κ(rel − d_过期)| ≈ κ·|d_新 − d_旧|  ≫  κ(r − ℓ)
+  // 于是残差被算得远小于真实值 —— 实测给出 1.2e-6 m/s² 的假阴性，
+  // 而用当前位置重算投影后是 10.28 m/s²。**假阴性比假阳性更危险**。
+  // 因此这里就地重算 d_c，不依赖 ctx.targets。
   static std::vector<Scalar> force;
   force.assign(static_cast<std::size_t>(n) * 3, Scalar{0});
   for (std::size_t c = 0; c < m.edges.size(); ++c) {
     const Edge& e = m.edges[c];
     const Vec3 rel = m.positions[static_cast<std::size_t>(e.a)] -
                      m.positions[static_cast<std::size_t>(e.b)];  // A_c x
-    const Vec3 kd = ctx.targets[c] * e.stiffness;                // κ_c d_c
-    const Vec3 contrib = rel * e.stiffness - kd;                 // κ(A_c x − d_c)
+    const Scalar len = length(rel);
+    // d_c = ℓ·unit(x_a − x_b)（当前位置的投影；退化时按 0 处理，与 project() 一致）
+    const Vec3 d = (len <= DistanceTerm::kMinLength) ? Vec3{} : rel * (e.restLength / len);
+    const Vec3 contrib = rel * e.stiffness - d * e.stiffness;  // κ(A_c x − d_c)
     const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
     const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
     force[ia + 0] += contrib.x;
