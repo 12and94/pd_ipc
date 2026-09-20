@@ -40,6 +40,7 @@ _verify/*.obj
 docs/render_*.png
 !docs/render_corners.png
 !docs/render_realtime.png
+!docs/render_live.png
 
 # ---- 系统 ----
 Thumbs.db

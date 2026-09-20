@@ -452,9 +452,23 @@ int main(int argc, char** argv) {
     refreshPinPositions(ctx);
   }
 
-  g_camera.target = Vec3{0.5 * (cfg.gridNx - 1) * cfg.gridSpacing, 0.0,
-                         0.5 * (cfg.gridNy - 1) * cfg.gridSpacing};
-  g_camera.distance = 1.2f;
+  // ---- 取景 ----
+  // 网格铺在 XZ 平面（y 朝上），默认钉住的是**上边**（z 最大的那一行）。
+  // 布料会绕这条钉住的边垂下来，因此布的实际包围盒是
+  //     x ∈ [0, W]，z ∈ [0, D]（钉住边在上方），y ∈ [-D, 0]（垂下部分）
+  // 镜头要对准这个包围盒的中心，而不是原点平面 —— 否则布会缩在画面角落。
+  //
+  // 视距由视场角反推，保证最短边也进画面：
+  //   垂直半视场角 = 22.5°，故 dist ≥ (包围盒高度/2 + 中心偏移) / tan(22.5°)。
+  // 这里再留 1.15 倍余量，避免贴边。
+  const double clothW = (cfg.gridNx - 1) * cfg.gridSpacing;
+  const double clothD = (cfg.gridNy - 1) * cfg.gridSpacing;
+  const double boxH = 0.5 * clothD;            // 包围盒高度（垂下半边）
+  const double centerY = -0.5 * clothD;        // 包围盒中心的 y
+  const double tanHalfFov = 0.4142135623730951;  // tan(22.5°)
+  g_camera.target = Vec3{0.5 * clothW, centerY, 0.5 * clothD};
+  g_camera.distance = static_cast<float>(1.15 * (std::fabs(centerY) + boxH + 0.5 * clothW) / tanHalfFov);
+  g_camera.pitch = 0.22f;  // 稍微俯视：既看得到垂下来的面，也看得到地面网格
 
   if (!glfwInit()) {
     std::printf("GLFW 初始化失败\n");
@@ -602,5 +616,10 @@ int main(int argc, char** argv) {
 
   glfwDestroyWindow(window);
   glfwTerminate();
+  // 退出原因诊断：区分"跑到 --frames 限额"（timeToStop）与"窗口被关闭"。
+  // 注：stdout 重定向到文件时是全缓冲，必须显式 fflush，否则日志看起来是空的。
+  std::printf("[退出] 共渲染 %d 帧，窗口关闭事件=%s\n", frameIndex,
+              (maxFrames > 0 && frameIndex >= maxFrames) ? "否（达到 --frames 限额）" : "是");
+  std::fflush(stdout);
   return 0;
 }
