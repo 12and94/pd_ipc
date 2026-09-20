@@ -465,12 +465,20 @@ int main(int argc, char** argv) {
   cfg.substepsPerFrame = 2;
   cfg.stiffness = stiffness;
   cfg.maxIterations = iters;
-  cfg.relTolerance = noEarlyExit ? 0.0 : tol;
-  cfg.absTolerance = noEarlyExit ? 0.0 : cfg.absTolerance;
-  // 残差判据也必须一起关掉，否则 --tol 0 / --no-early-exit 仍会提前退出
-  // （它是本项目 2026-09-20 新增的判据，默认 1e-3，与位移判据是 OR 关系）。
-  if (noEarlyExit) cfg.residualTolerance = 0.0;
+  cfg.relTolerance = tol;
+  // 三个容差的赋值必须**按优先级从低到高**排好顺序，否则后面的会覆盖前面的。
+  // 曾经的缺陷：先 `if (noEarlyExit) residualTolerance = 0`，紧接着
+  // `if (residualTol >= 0) residualTolerance = residualTol` —— 而 residualTol 的
+  // 默认值是 0.3 而非负值，于是 --no-early-exit 被下一行推翻，
+  // 迭代仍然提前退出（实测 19/40 次），而参数行又打印 residual_tol=0 造成误报。
+  // 现在的语义：--no-early-exit 优先级最高；否则 --residual-tol 显式值优先；
+  // 都没给才用 SceneConfig 的默认值。
   if (residualTol >= 0.0) cfg.residualTolerance = residualTol;
+  if (noEarlyExit) {
+    cfg.relTolerance = 0.0;
+    cfg.absTolerance = 0.0;
+    cfg.residualTolerance = 0.0;
+  }
   cfg.velocityDamping = damping;  // 历史缺陷：解析了 --damping 却没赋给 cfg，该选项不生效
   SimContext ctx = makeScene(cfg);
 
@@ -645,9 +653,15 @@ int main(int argc, char** argv) {
     // 每秒在控制台也打一行，便于无 GUI 环境核对
     if (now - hudTimer > 1.0) {
       hudTimer = now;
-      std::printf("fps %.1f  帧 %.2f ms  物理 %.2f ms  迭代 %d  应变 max %.4f  mean %.4f  分解 %d 次\n",
-                  g_state.fpsAvg, g_state.frameMsAvg, g_state.physicsMsAvg, ctx.iterationsUsed,
-                  ctx.mesh.maxRelativeStrain(), ctx.mesh.meanRelativeStrain(), ctx.factorizeCount);
+      // 收敛状态必须显示：区分"达到判据而停"与"迭代用完了而停"。
+      // 后者在报告里不能当成收敛（见 docs/pd-convergence.md 与 Scene.h 的 converged）。
+      const char* st = ctx.converged ? "收敛" : "用尽迭代";
+      std::printf(
+          "fps %.1f  帧 %.2f ms  物理 %.2f ms  迭代 %d  应变 max %.4f  mean %.4f  "
+          "分解 %d 次  %s  残差 %.4g\n",
+          g_state.fpsAvg, g_state.frameMsAvg, g_state.physicsMsAvg, ctx.iterationsUsed,
+          ctx.mesh.maxRelativeStrain(), ctx.mesh.meanRelativeStrain(), ctx.factorizeCount, st,
+          ctx.lastResidual);
     }
   }
 

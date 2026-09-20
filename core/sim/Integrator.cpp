@@ -204,6 +204,7 @@ int stepOnce(SimContext& ctx) {
   // ---------------------------------------------------------------
   std::vector<Vec3> previous = m.positions;
   int usedIterations = 0;
+  ctx.converged = false;  // 本子步是否达到收敛判据（而非用尽迭代预算）
 
   for (int k = 0; k < cfg.maxIterations; ++k) {
     // 4a) 局部步：逐约束独立闭式投影（可并行，无耦合）
@@ -292,7 +293,23 @@ int stepOnce(SimContext& ctx) {
       ctx.lastResidual = residual;
 
       PD_TRACE("迭代 %d: |Δx|∞=%.6g 相对=%.6g 残差=%.6g m/s^2", usedIterations, diff, rel, residual);
-      if (absHit || relHit || resHit) {
+
+      // ---- 收敛判定 ----
+      //
+      // **启用残差判据时，残差达标是收敛的必要条件**，位移判据不得单独放行。
+      // 理由：位移判据只能说"这一步没怎么动"，而"没怎么动"既可能是收敛，
+      // 也可能是停滞（高刚度下更新量是被 L 预条件后的梯度，小更新不保证小残差）。
+      // 若让 `absHit || relHit` 独立触发退出，就会出现"残差 4.85 m/s² 而门槛
+      // 要求 9.8e-3 却判收敛"的情形 —— 这个组合曾被实测复现。
+      // 因此：residualTolerance > 0 时只认 resHit；为 0（未启用）时才退回位移判据。
+      bool converged = false;
+      if (cfg.residualTolerance > 0.0) {
+        converged = resHit;
+      } else {
+        converged = absHit || relHit;
+      }
+      if (converged) {
+        ctx.converged = true;
         ctx.earlyExitCount += 1;
         break;
       }

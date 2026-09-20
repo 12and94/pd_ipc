@@ -116,6 +116,9 @@ struct SimContext {
   int iterationsUsed = 0;       ///< 最近一个子步用掉的 PD 迭代数
   int earlyExitCount = 0;       ///< 累计"未跑满 maxIterations 就判收敛退出"的子步数
                                 ///< （诊断用：判断收敛判据是否过于宽松的关键指标）
+  bool converged = false;       ///< 最近一个子步是否**达到收敛判据**（而非用尽迭代预算）
+                                ///< 区分"解好了"与"迭代用完了"：后者在报告里必须写清，
+                                ///< 不能当成收敛。见 docs/pd-convergence.md。
   Scalar lastResidual = -1.0;   ///< 最近一次迭代的**非线性残差**（m/s²，最大不平衡力/质量）
                                 ///< 负值表示本子步未启用残差判据（residualTolerance <= 0）
 
