@@ -4,33 +4,57 @@
 
 ---
 
-## 1. 【铁律】禁止参考任何外部同类实现
+## 1. 【铁律】禁止参考 `dp_ipc` 工程
 
-本项目**不允许**以任何形式参考、借用、搬运或对照任何外部同类实现（本机工作区中其他目录下的项目一律在内）。
+本项目**只隔离 `D:\dsh_workspace\dp_ipc` 这一个工程**，不允许以任何形式参考、借用、搬运或对照它。**其他项目（`learn_cloth`、`about_houdini` 等）不受此限**：可以读、可以引用、可以对照、也可以复用其经验与做法。
 
-| 禁止项 | 具体含义 |
+| 禁止项 | 具体含义（仅针对 `dp_ipc`） |
 |---|---|
 | 不读源码 | 其求解器、碰撞、约束、网格、渲染、着色器、测试，一概不读 |
 | 不搬运 | 不复制任何代码片段、数据结构、参数默认值、配置文件 |
 | 不引用结论 | 其文档、推导、调试记录、"已验证"的说法一律不作为依据 |
 | 不与其对照 | 不做"和它对齐 / 比它更好"的验证 |
-| 不依赖其路径 | 构建脚本、配置、测试一律使用本项目内相对路径，不引用任何外部工程目录 |
+| 不依赖其路径 | 构建脚本、配置、测试一律使用本项目内相对路径，不引用 `dp_ipc` 目录 |
 | 不留痕迹 | 代码注释、文档、提交信息中不得出现对该工程的引用 |
 
-### 为什么
-正确性必须来自**独立推导 + 原语不变量断言 + 与解析解对照**。以他人实现为参照，会把对方的隐含假设（无论对错）带进来，把"验证"降级为"复现"，并且失去独立的第二意见。
+### 为什么只锁这一个
+正确性必须来自**独立推导 + 原语不变量断言 + 与解析解对照**。`dp_ipc` 是本项目的**前身**：同一批作者、同一套建模假设、同一个 PD 内核的早期形态。拿它当参照，等于让一个含未修缺陷的早期版本替本轮的独立推导背书，把"验证"降级为"复现"，并且失去独立的第二意见——`README.md` §4 记的缺陷 A/B/C 恰恰是"自己验证自己"漏掉的那类错误。这跟"对外部实现一律设防"是两件事。
+
+### 放开的部分
+其他工程的源码、文档、方案、参数都可以参考。但要注意两点：
+1. **正确性的最终判据不变**：仍然是独立推导 + 不变量 + 解析解；"别人也这么做"不构成验证。
+2. **引用要留痕**：凡采用了外部做法的，在代码注释或文档里注明来源与理由，便于日后追溯。
 
 ### 怎么检查
-本项目根目录名即本工程身份；违规的模式是**引用其他工程**，例如指向 workspace 下别的目录。CI 增加一项文本扫描，命中即失败：
+CI 扫描**只针对 `dp_ipc`**，分两层。为什么必须分两层：规则本身要写出"禁止参考 `dp_ipc`"这句话，所以只定义规则的四个文件天然会命中——第一层必须把它们排除，否则门禁第一次运行就会因自己的规则文本失败（旧规则犯的正是这个错：`dsh_workspace\\[^\\]+` 连本项目自己的 `cd D:\dsh_workspace\pd_ipc` 都会命中）。
 
 ```powershell
-# 在仓库根运行；命中任何结果即视为违规（本文件自身除外）
-$files = Get-ChildItem -Recurse -File -Include *.cpp,*.h,*.hpp,*.md,*.cmake,*.txt,*.ps1,*.json |
-         Where-Object { $_.FullName -notlike '*\docs\contributing.md' }
-Select-String -Path $files.FullName -Pattern 'dsh_workspace\\[^\\]+'
+# 在仓库根运行；任一层命中即视为违规
+$scan = Get-ChildItem -Recurse -File -Include *.cpp,*.h,*.hpp,*.md,*.cmake,*.txt,*.ps1,*.json |
+        Where-Object { $_.FullName -notlike '*\build\*' }   # build/ 是 CMake 生成物，不参与
+
+# 白名单：只有这四个文件在定义规则，允许出现该名称。
+# 新增白名单条目必须同时在 review 中说明理由 —— 这是唯一的规避口子，保持最小。
+$whitelist = 'docs\contributing.md','docs\plan.md','docs\environment.md','docs\design-discussion.md'
+$defs = $scan | Where-Object { $rel = $_.FullName; $whitelist | Where-Object { $rel -like "*$_" } }
+
+# 第 1 层：白名单之外，任何提及都算违规（引用、路径、结论都拦得住）
+$t1 = $scan | Where-Object { $_.FullName -notin $defs.FullName } |
+      Select-String -Pattern 'dp[_-]ipc' -ErrorAction SilentlyContinue
+
+# 第 2 层：白名单之内也不许出现**真实路径**（规则正文只该用裸名称 dp_ipc）
+$t2 = Select-String -Path $defs.FullName -Pattern 'dp[_-]ipc(\.exe|\.md|\.cpp|\.h|\\|/)' -ErrorAction SilentlyContinue
+
+if ($t1 -or $t2) {
+  $t1; $t2
+  throw "违规：引用了 dp_ipc 工程（第1层 $($t1.Count) 处 / 第2层 $($t2.Count) 处）"
+}
+"OK：未发现对 dp_ipc 的引用（已扫描 $($scan.Count) 个文件，白名单 $($defs.Count) 个）"
 ```
 
-（`docs\contributing.md` 自身需要说明该模式，故排除；其余任何文件中出现对本工作区其他工程的路径引用都算违规。）
+两点说明：
+- **`docs/code-map.md` 不在白名单里也不需要**——它引的是本项目自己的路径（`cd D:\dsh_workspace\pd_ipc`），新模式 `dp[_-]ipc` 不会误伤它；旧规则会。
+- 第 2 层是这次补上的：只做第 1 层时，规则文件自己就能写进"该工程某源码文件里的做法是……"这种带真实路径的引用而无人察觉。因此规则正文只使用裸名称 `dp_ipc`，不写它的任何路径或文件名 —— 当前四个文件正是这样。
 
 ---
 
