@@ -255,7 +255,12 @@ $$L \;=\; \underbrace{M/h^2}_{\text{对角}} \;+\; \sum_t \kappa_t\,A_t^\top A_t
 > 2. **跨帧只在 stamp 事件上变**：拓扑（含撕裂/重网格）、材料刚度 $\kappa$、子步长 $h$（经 $M/h^2$）、pin 掩码。除此之外的任何帧都不允许触发重分解。
 > 3. **各组成项为何与 $x$ 无关**：$A_c$ 只是拓扑的常数编码（距离约束为 $(e_i-e_j)\otimes I_3$；三角形约束为 $\frac{1}{\sqrt2}\mathrm{vec}(F)$，其系数由**静止**形变 $\bar F^{-1}$ 定），不含当前位置；$w_c$ 是材料参数，局部步更新的是目标 $d_c$ 而非权重；$M$ 由静止几何算出。**旋转类局部标架（ARAP / shape matching）进入右端 $A_c^\top R_c$，不进左端。**
 > 4. **非线性全部去右端 / 局部步**：这正是 PD 的分工，也是接触能挂上来的原因 —— 接触不做成 barrier Hessian 进 $L$，而做成局部步的可行集投影（见 `docs/design-discussion.md` §5）。
-> 5. **测试方式**：`tests/primitives` 断言"同一时间步内连续 $K$ 次迭代，$L$ 的哈希（或逐元素快照）不变、重分解计数恒为 0"；并反向断言"改 $\kappa$ / 换 $h$ 档位 / 改拓扑后，必须有恰好一次重分解"。
+> 5. **测试方式**：`tests/primitives/test_distance_term.cpp` 的
+>    `stampChangesOnlyWhenLeftHandSideValuesChange` 断言"该变的必变、不该变的必不变"
+>    （并逐位验证改 pin 位置/阻尼后 $L$ 相同）；
+>    `tests/chain/spring_vertical.cpp` 的 `globalMatrixIsFactoredOnceAndReused`
+>    断言"2000 步内分解恒为 1 次；改 $\kappa$ / 换 $h$ / 改 pin 掩码各触发恰好一次"。
+>    —— 这两条是**已有实现**的不变量门禁；新增任何"失效条件"前先确认它们仍然通过。
 > 6. **注意不要说过头**：不是"$L$ 永远不变"，而是"帧内不变 + 跨帧只在上述事件上变"。某些 PD 变体（每次迭代重算 $\nabla\theta$、把 exact Hessian 放进矩阵、mode switching）是**故意**放弃这个性质的，代价就是失去复用 —— 我们选择不这么做（D2/D3）。
 - **失效（需重分解）的条件必须显式建模**，用一个 `SolverStamp`：
   `{ topology_id, stiffness_hash, mass_hash, h, pin_mask_hash }` —— 任一变化才重分解。
@@ -427,6 +432,13 @@ $$\text{stop when } \|x^{(k+1)}-x^{(k)}\|_\infty \le \tau_{\text{abs}} \ \ \text
 **产物**：`tests/chain/`（上表逐项可执行）+ `docs/perf.md` 第一版（单线程基线耗时表）+ 一份**刚度标定记录**（把 $k_{\text{stretch}}$ 默认值定下来，判据：0.4 m 布料的垂度落在 0.05–0.15 m、应变 < 5 %）。
 
 **意义**：M2 的并行化会引入竞态与浮点求和顺序差异。如果此时链路本身还有缺陷，两类问题无法区分。这道门的作用是让 M2 的失败**只可能**是并行引入的。
+
+> **下表是规格，不是完成声明。** 当前已实现并有可重跑断言覆盖的是：
+> 第 0 项（两顶点弹簧 7 项全绿）、第 1 项的自由落体部分（`pd_check` 第 5 项目）、
+> 第 7 项的 pin 严格性与能量有界部分。
+> 其余各项（悬链、12×12 垂度、迭代数敏感性、$\|x_{\text{mesh}}-x_{\text{solver}}\|$
+> 严格为 0、刚度扫描、单摆周期）**尚未写成测试**，`tests/chain/` 目前只有
+> `spring_vertical.cpp` 一个文件。做 M2 之前需要先把它们补齐。
 
 ### M2 — 并行化与性能（预计 4–5 天）
 
