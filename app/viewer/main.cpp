@@ -399,15 +399,22 @@ int main(int argc, char** argv) {
   int maxFrames = 0;          // >0 时跑够帧数就退出（用于自动化验证）
   std::string shotPath;       // 非空则截图后退出
   int gridN = 60;
-  double stiffness = 1.0e5;
+  double stiffness = 2.3e3;   // 刚度标定值，见 core/sim/Scene.h 的说明
   bool pinTopEdge = true;
   bool pinSingle = false;
   int iters = 40;
-  double tol = 1.0e-5;
+  // 收敛门槛取"实时档"：残差上限 0.3·|g|。
+  // 实测（kappa=2305、60x60、600 帧）：门槛 0.3g 时每子步 1 次迭代、
+  // 物理 3.2 ms/帧、58 FPS；门槛 1e-3 则 40 次迭代、47 ms、19 FPS。
+  // 这是个**诚实的取舍**：40 次迭代内压不到 0.1g 以下，所以要么放宽门槛、
+  // 要么接受不可实时。SceneConfig 的默认值保持保守（1e-3），需要精度的
+  // 无窗口运行应显式设小；查看器面向交互，取实用档。
+  // 详见 docs/pd-convergence.md 4.3 节。
+  double tol = 1.0e-5;          // 位移判据（需要更严时用它）
+  double residualTol = 3.0e-1;  // 残差判据：0.3 × |g|
   double damping = 0.02;
-  bool noEarlyExit = false;   // 关闭全部提前退出，强制每子步跑满 --iters
-  double residualTol = -1.0;  // <0 表示用 SceneConfig 的默认值
-  double dt = 1.0 / 120.0;    // 子步长 h
+  bool noEarlyExit = false;     // 关闭全部提前退出，强制每子步跑满 --iters
+  double dt = 1.0 / 120.0;      // 子步长 h
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -445,9 +452,9 @@ int main(int argc, char** argv) {
   //   对照实验实际上仍会提前退出，得出错误结论。)
   if (tol == 0.0) noEarlyExit = true;
 
-  std::printf("[参数] grid=%d frames=%d shot=%s stiffness=%g iters=%d tol=%g damping=%g%s\n", gridN,
-              maxFrames, shotPath.c_str(), stiffness, iters, tol, damping,
-              noEarlyExit ? " no-early-exit" : "");
+  std::printf("[参数] grid=%d frames=%d shot=%s stiffness=%g iters=%d tol=%g residual_tol=%g damping=%g%s\n",
+              gridN, maxFrames, shotPath.c_str(), stiffness, iters, tol,
+              noEarlyExit ? 0.0 : residualTol, damping, noEarlyExit ? " no-early-exit" : "");
 
   // 先建场景（无窗口也能验证物理链路）
   SceneConfig cfg;
