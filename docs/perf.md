@@ -461,6 +461,10 @@ Remove-Item Env:\PD_DEBUG_RESIDUAL
 
 # 运行时核对（换过 OpenMP 开关之后必做）：exe 里不应出现 libomp
 #   $b=[IO.File]::ReadAllBytes("build\Release\pd_bench.exe"); ([regex]::Matches([Text.Encoding]::ASCII.GetString($b),'libomp')).Count
+
+# 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3 A/B + 查看器时间线）
+node build\_perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
+node build\_perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
 ```
 
 > **每次触及热路径的改动都要在本文件补"前后对照"**（`docs/contributing.md` §6），
