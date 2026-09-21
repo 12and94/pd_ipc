@@ -19,8 +19,11 @@
 namespace pd {
 
 /// 全局可配置的线程数。
-/// 注意：本机 20 个逻辑核里含 4 个 E-core（见 docs/environment.md），
-/// 因此默认不取 hardware_concurrency 的全部，也不假设线性加速。
+/// **默认值 4 是实测标定的结果，不是 `hardware_concurrency() - 2`**：
+/// 本机（20 逻辑核 = 8 P-core 含超线程 + 4 E-core）上，18 线程在每个工况都是最差的
+/// （40×40 慢 39 %、交互档慢 47 %），原因是同步成本随参与者上升、串行段被线程池拖慢、
+/// 每线程的活太小。标定表与原因见 `core/math/Parallel.cpp` 顶部与 `docs/perf.md` §6。
+/// 这是机器相关参数，换机器/换数量级需重新标定。
 int numThreads();
 void setNumThreads(int n);
 

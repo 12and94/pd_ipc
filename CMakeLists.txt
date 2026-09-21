@@ -23,6 +23,31 @@ endif()
 
 set(GLFW_ROOT "D:/Vulkan/glfw-3.3.8.bin.WIN64" CACHE PATH "GLFW 预编译包根目录")
 
+# ---------------------------------------------------------------------------
+# OpenMP 运行时选择（2026-09-21）
+#   MSVC 默认的 /openmp 用经典 vcomp 运行时；/openmp:llvm 用 libomp，
+#   后者支持 OMP_WAIT_POLICY（让空闲线程真正挂起）。
+#
+#   **实测结论：libomp 在本项目上明显更差，不要用它。**
+#   40×40 / iters40 / 300 子步：散射阶段 18 线程时 vcomp 323 ms → libomp 3466 ms（10.7×），
+#   整机单子步 8.34 → 22.5 ms；OMP_WAIT_POLICY=passive 也救不回（21.4 ms）。
+#   所以"换运行时解决串行段被自旋拖慢"这条假设被否掉了（见 docs/perf.md §6）。
+#   开关保留下来是为了让这个负面结果可复现。
+#
+#   注意：两个分支都必须 FORCE —— 否则从 ON 切回 OFF 时 CMake 缓存里会留着
+#   `/openmp:llvm`（本项目真的踩过：切回 OFF 后仍用 libomp，导致好几轮测量数据失真）。
+# ---------------------------------------------------------------------------
+set(PD_OPENMP_LLVM OFF CACHE BOOL "用 /openmp:llvm（libomp）而不是经典 /openmp（vcomp）")
+if(MSVC)
+  if(PD_OPENMP_LLVM)
+    set(OpenMP_CXX_FLAGS "/openmp:llvm" CACHE STRING "" FORCE)
+    message(STATUS "OpenMP: /openmp:llvm（libomp）—— 实测比 vcomp 慢很多，仅供复现负面结果")
+  else()
+    set(OpenMP_CXX_FLAGS "/openmp" CACHE STRING "" FORCE)
+    message(STATUS "OpenMP: /openmp（vcomp，默认）")
+  endif()
+endif()
+
 find_package(OpenMP QUIET)
 
 # ---------------------------------------------------------------------------
