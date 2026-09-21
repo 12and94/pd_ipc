@@ -7,10 +7,14 @@
 //   否则一个量级错误会被一堆互相印证的派生指标掩盖。
 #include "core/assemble/Assembler.h"
 #include "core/energy/DistanceTerm.h"
+#include "core/math/Parallel.h"
 #include "core/mesh/Mesh.h"
 #include "tests/primitives/test_harness.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <string>
 
 using namespace pd;
 
@@ -364,6 +368,178 @@ TEST(packUnpackRoundTrip) {
   for (std::size_t i = 0; i < in.size(); ++i) {
     CHECK(out[i].x == in[i].x && out[i].y == in[i].y && out[i].z == in[i].z);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 6) 并行散射分支的对照 —— 此前**完全无覆盖**，这是它的第一个测试
+//
+// 为什么必须单独钉它：`scatterInto` 在 `ne < 256` 或单线程时走**串行分支**，
+// 而本文件此前所有散射测试（以及 _verify/direction_audit）用的都是**单条边**的网格，
+// 于是 **OpenMP 分支从未被任何测试执行过** —— 只有 bench/viewer 会走到它。
+// 这正是"并行散射每线程持有一份全维缓冲、每次调用清零并全量累加 P*dim"
+// 这个 O(P*dim) 代价长期没被发现的原因（见 README §5 第 7 项）。
+//
+// 判据：并行分支与串行分支、以及一份**独立写出的**参考实现，必须给出同一个右端。
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 20x20 规则网格：400 顶点、760 条边（> 256，保证触发并行分支）。
+/// 位形做成确定性的非平凡扰动：既避开退化边，也避开对称（对称会让"符号错"
+/// 这类缺陷在不同位置互相抵消，掩盖问题）。
+Mesh makePerturbedGrid(int n, Scalar spacing, Scalar stiffness) {
+  Mesh m = Mesh::makeGrid(n, n, spacing);
+  for (auto& e : m.edges) e.stiffness = stiffness;
+  for (int v = 0; v < m.vertexCount(); ++v) {
+    const Scalar i = static_cast<Scalar>(v % n);
+    const Scalar j = static_cast<Scalar>(v / n);
+    Vec3& p = m.positions[static_cast<std::size_t>(v)];
+    p.x += spacing * 0.20 * std::sin(1.7 * i + 0.5 * j);
+    p.y += spacing * 0.30 * std::cos(0.9 * i - 1.3 * j);
+    p.z += spacing * 0.25 * std::sin(0.4 * i + 2.1 * j);
+  }
+  // 钉两个对角顶点：边表里同时存在"两端自由""a 端 pin""b 端 pin"三种情形，
+  // 于是 pin 消元补偿的两个分支都会被走到。
+  m.pinned[0] = 1;
+  m.pinned[static_cast<std::size_t>(m.vertexCount() - 1)] = 1;
+  m.pinPositions = m.positions;  // 契约：有 pinned 就必须填好 pinPositions
+  return m;
+}
+
+/// 独立参考实现：按**边序号顺序**把贡献加进 b。刻意与 core 的实现分开写，
+/// 避免"自己验证自己"。语义取自 docs/plan.md §2.2.1：
+///   b_a += κ d_c、b_b -= κ d_c；单端 pinned 时给自由端补 +κ q。
+std::vector<Scalar> referenceScatter(const Mesh& m, const std::vector<Vec3>& targets) {
+  std::vector<Scalar> b(static_cast<std::size_t>(3 * m.vertexCount()), 0.0);
+  for (std::size_t c = 0; c < m.edges.size(); ++c) {
+    const Edge& e = m.edges[c];
+    const bool aPinned = m.isPinned(e.a);
+    const bool bPinned = m.isPinned(e.b);
+    if (aPinned && bPinned) continue;
+    const Vec3 contrib = targets[c] * e.stiffness;
+    const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
+    const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
+    if (!aPinned) {
+      b[ia + 0] += contrib.x;
+      b[ia + 1] += contrib.y;
+      b[ia + 2] += contrib.z;
+    }
+    if (!bPinned) {
+      b[ib + 0] -= contrib.x;
+      b[ib + 1] -= contrib.y;
+      b[ib + 2] -= contrib.z;
+    }
+    if (aPinned && !bPinned) {
+      const Vec3& q = m.pinPositions[static_cast<std::size_t>(e.a)];
+      b[ib + 0] += e.stiffness * q.x;
+      b[ib + 1] += e.stiffness * q.y;
+      b[ib + 2] += e.stiffness * q.z;
+    } else if (bPinned && !aPinned) {
+      const Vec3& q = m.pinPositions[static_cast<std::size_t>(e.b)];
+      b[ia + 0] += e.stiffness * q.x;
+      b[ia + 1] += e.stiffness * q.y;
+      b[ia + 2] += e.stiffness * q.z;
+    }
+  }
+  return b;
+}
+
+double maxAbsValue(const std::vector<Scalar>& v) {
+  double w = 0.0;
+  for (Scalar x : v) w = std::max(w, std::fabs(static_cast<double>(x)));
+  return w;
+}
+
+double maxAbsDiff(const std::vector<Scalar>& a, const std::vector<Scalar>& b) {
+  double w = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    w = std::max(w, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+  }
+  return w;
+}
+
+}  // namespace
+
+TEST(parallelScatterMatchesSerialReference) {
+  const int savedThreads = numThreads();  // 必须还原：本套件其余测试共用同一进程
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+
+  // 前置条件：网格必须真的能触发并行分支（ne >= 256），否则这个测试等于没测。
+  CHECK_MSG(m.edgeCount() >= 256,
+            "边数 " + std::to_string(m.edgeCount()) + " < 256，不会走并行分支");
+  CHECK(m.countDuplicateEdges() == 0);
+
+  std::vector<Vec3> targets;
+  DistanceTerm::project(m, targets);
+  const std::vector<Scalar> ref = referenceScatter(m, targets);
+  const std::size_t dim = static_cast<std::size_t>(3 * m.vertexCount());
+
+  std::vector<Scalar> bSerial(dim, 0.0);
+  setNumThreads(1);
+  DistanceTerm::scatterInto(m, targets, bSerial.data(), bSerial.size());
+
+  std::vector<Scalar> bParallel(dim, 0.0);
+  setNumThreads(18);
+  DistanceTerm::scatterInto(m, targets, bParallel.data(), bParallel.size());
+  setNumThreads(savedThreads);
+
+  const double scale = std::max(1.0, maxAbsValue(ref));
+  const double tol = 1e-12 * scale;
+  const double dSerialRef = maxAbsDiff(bSerial, ref);
+  const double dParallelRef = maxAbsDiff(bParallel, ref);
+  const double dParallelSerial = maxAbsDiff(bParallel, bSerial);
+
+  char buf[360];
+  std::snprintf(buf, sizeof(buf),
+                "20x20 网格(%d 边, 含 2 个 pin) 最大差: 串行vs参考 %.3g, 并行vs参考 %.3g, "
+                "并行vs串行 %.3g   (容差 %.3g, 量级 %.3g)",
+                m.edgeCount(), dSerialRef, dParallelRef, dParallelSerial, tol, scale);
+  CHECK_MSG(dSerialRef <= tol, buf);
+  CHECK_MSG(dParallelRef <= tol, buf);
+  CHECK_MSG(dParallelSerial <= tol, buf);
+
+  // 诊断（不作断言）：位级是否相同 —— 这决定"与线程数无关"到底是结构保证还是经验观察。
+  std::printf("    [注] 并行分支位级等于串行分支: %s（最大差 %.3g）\n",
+              (dParallelSerial == 0.0) ? "是" : "否", dParallelSerial);
+}
+
+TEST(scatterIsThreadCountIndependent) {
+  const int savedThreads = numThreads();
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+  std::vector<Vec3> targets;
+  DistanceTerm::project(m, targets);
+  const std::size_t dim = static_cast<std::size_t>(3 * m.vertexCount());
+
+  std::vector<Scalar> base(dim, 0.0);
+  setNumThreads(1);
+  DistanceTerm::scatterInto(m, targets, base.data(), base.size());
+
+  const double scale = std::max(1.0, maxAbsValue(base));
+  const double tol = 1e-12 * scale;
+  double worst = 0.0;
+  int runs = 0;
+  int bitwiseSame = 0;
+
+  for (const int threads : {2, 4, 8, 18}) {
+    setNumThreads(threads);
+    // 同一线程数重复 4 次：`schedule(dynamic, 64)` 的分块分配一旦变化，
+    // 求和分组就变 —— 重复运行是暴露它的最便宜手段。
+    for (int rep = 0; rep < 4; ++rep) {
+      std::vector<Scalar> b(dim, 0.0);
+      DistanceTerm::scatterInto(m, targets, b.data(), b.size());
+      const double d = maxAbsDiff(b, base);
+      worst = std::max(worst, d);
+      ++runs;
+      if (d == 0.0) ++bitwiseSame;
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "%d 线程第 %d 次: 与 1 线程结果最大差 %.3g > 容差 %.3g",
+                    threads, rep + 1, d, tol);
+      CHECK_MSG(d <= tol, buf);
+    }
+  }
+  setNumThreads(savedThreads);
+
+  std::printf("    [注] 跨线程数/重复运行共 %d 次，最大差 %.3g（量级 %.3g）；其中位级相同 %d 次\n",
+              runs, worst, scale, bitwiseSame);
 }
 
 TEST_MAIN("primitives/distance_term")

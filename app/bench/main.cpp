@@ -31,9 +31,13 @@ void printUsage() {
       "  --density RHO       面密度（默认 1.0）\n"
       "  --damping KD        速度阻尼（默认 0.02）\n"
       "  --iters N           每子步最大 PD 迭代数（默认 10）\n"
-      "  --tol T             相对收敛判据（默认 1e-3）\n"
+      "  --residual-tol T    残差判据：不平衡力上限 = T×|g|（默认 1e-3）。<=0 表示禁用\n"
+      "  --tol T             位移判据：相对容差 relTolerance（默认 1e-3）\n"
+      "                      **注意：残差判据启用（residualTolerance>0）时它是唯一放行条件，\n"
+      "                      此时 --tol 不改变迭代数；要复现文档里的\"位移判据提前退出\"必须先\n"
+      "                      用 --residual-tol 0 关掉残差判据，见 core/sim/Integrator.cpp 第 4e 步\n"
       "  --threads N         线程数（默认自动）\n"
-      "  --pin-top           pin 顶边两角（默认行为）\n"
+      "  --pin-top           pin 顶边两角（默认行为，显式给出便于脚本自述）\n"
       "  --pin-all           pin 所有顶点（用于验证自由度为 0 的退化情形）\n"
       "  --report N          每 N 步打印一次\n");
 }
@@ -82,8 +86,15 @@ int main(int argc, char** argv) {
       next(cfg.velocityDamping);
     } else if (a == "--iters") {
       nextInt(cfg.maxIterations);
+    } else if (a == "--residual-tol") {
+      // 真正的放行判据（残差判据）。以前只能改 relTolerance，而它对迭代数
+      // **完全无效** —— 残差判据启用时是唯一放行条件，于是基准无法复现
+      // docs/pd-convergence.md §4.3 的"门槛 vs 代价"对照。
+      next(cfg.residualTolerance);
     } else if (a == "--tol") {
       next(cfg.relTolerance);
+    } else if (a == "--pin-top") {
+      // 默认行为：makeScene 已钉住顶边两角。显式接受它，免得被当成未知参数静默忽略。
     } else if (a == "--threads") {
       nextInt(threads);
     } else if (a == "--pin-all") {
@@ -107,8 +118,17 @@ int main(int argc, char** argv) {
   std::printf("=== PD 布料基准（CPU 方向 1）===\n");
   std::printf("顶点 %d  约束 %d  质量 %.6g  线程 %d\n", ctx.mesh.vertexCount(), ctx.mesh.edgeCount(),
               ctx.mesh.totalMass(), numThreads());
-  std::printf("dt %.6g  子步/帧 %d  刚度 %.6g  PD 迭代上限 %d  容差 %.3g\n", cfg.dt,
-              cfg.substepsPerFrame, cfg.stiffness, cfg.maxIterations, cfg.relTolerance);
+  std::printf("dt %.6g  子步/帧 %d  刚度 %.6g  PD 迭代上限 %d\n", cfg.dt, cfg.substepsPerFrame,
+              cfg.stiffness, cfg.maxIterations);
+  // 两个容差必须分别打印：它们不是"松/紧"的关系，而是"谁在放行"的关系。
+  // 残差判据启用时位移判据完全不参与判定，只打印 relTolerance 会让人误以为调它有用。
+  std::printf("位移容差 %.3g%s   残差容差 %.3g%s（不平衡力上限 = 容差×|g| = %.4g m/s²）\n",
+              cfg.relTolerance,
+              (cfg.residualTolerance > 0.0) ? "（不参与判定）" : "（放行判据）",
+              cfg.residualTolerance,
+              (cfg.residualTolerance > 0.0) ? "（放行判据）" : "（已禁用）",
+              (cfg.residualTolerance > 0.0) ? cfg.residualTolerance * length(cfg.gravity) : 0.0);
+  std::printf("pin: %s\n", pinAll ? "全部顶点（--pin-all）" : "顶边两角（默认）");
   std::printf("（L 的自由度 %d，nnz 在下方「分解复用」一节给出；"
               "符号/数值分解推迟到首次 stepOnce 内完成）\n\n",
               3 * ctx.mesh.vertexCount());
@@ -118,9 +138,15 @@ int main(int argc, char** argv) {
   const auto wall0 = std::chrono::steady_clock::now();
   double worstStrain = 0.0;
   int totalIterations = 0;
+  int maxIterationsUsed = 0;
+  int convergedSteps = 0;
   for (int s = 0; s < steps; ++s) {
     const int used = stepOnce(ctx);
     totalIterations += used;
+    maxIterationsUsed = std::max(maxIterationsUsed, used);
+    // 区分"达到判据而停"与"迭代用完了而停"（见 Scene.h 的 converged）：
+    // 前者说明这个子步解好了，后者只是预算耗尽。平均迭代数相同、性质完全不同。
+    if (ctx.converged) ++convergedSteps;
     worstStrain = std::max(worstStrain, ctx.mesh.maxRelativeStrain());
     if (cfg.reportEvery > 0 && (s + 1) % cfg.reportEvery == 0) {
       std::printf("  step %6d  迭代 %2d  应变(均值) %.4g  能量 %.6g  速度上限 %.4g\n", s + 1, used,
@@ -132,8 +158,18 @@ int main(int argc, char** argv) {
   const auto& t = ctx.times;
   const double perStepMs = 1000.0 * wall / std::max(1, steps);
   std::printf("--- 结果 ---\n");
-  std::printf("子步数 %d   总耗时 %.3f s   单子步 %.3f ms   平均迭代 %.2f\n", steps, wall, perStepMs,
-              static_cast<double>(totalIterations) / std::max(1, steps));
+  std::printf("子步数 %d   总耗时 %.3f s   单子步 %.3f ms   平均迭代 %.2f   单步最多迭代 %d\n", steps, wall,
+              perStepMs, static_cast<double>(totalIterations) / std::max(1, steps), maxIterationsUsed);
+  // 收敛统计：把"跑满上限"明确写出来。上一版只报平均迭代数，导致
+  // "撞满上限"与"正常收敛"在输出里长得一样（README §3.5 的旧数字正是这样被读错的）。
+  {
+    const bool resGate = (cfg.residualTolerance > 0.0);
+    const bool dispGate = (cfg.absTolerance > 0.0) || (cfg.relTolerance > 0.0);
+    std::printf("收敛：%d/%d 子步达到判据（放行判据 %s）；末次残差 %.6g m/s²%s\n", convergedSteps, steps,
+                resGate ? "残差" : (dispGate ? "位移" : "无（跑满上限）"),
+                ctx.lastResidual,
+                resGate ? "" : "（未启用残差判据，负值表示未计算）");
+  }
   std::printf("最终应变: 最大 %.6g  平均 %.6g\n", ctx.mesh.maxRelativeStrain(),
               ctx.mesh.meanRelativeStrain());
   std::printf("全程最大应变 %.6g\n", worstStrain);
@@ -147,10 +183,13 @@ int main(int argc, char** argv) {
   std::printf("  组装+分解 %10.3f  %5.1f%%  （只应在 stamp 变化时发生）\n", t.assemble * 1e3,
               pct(t.assemble));
   std::printf("  全局回代  %10.3f  %5.1f%%\n", t.solve * 1e3, pct(t.solve));
+  std::printf("  解包+判据 %10.3f  %5.1f%%  （逐顶点融合的一趟；含 barrier 等待）\n", t.unpackScan * 1e3,
+              pct(t.unpackScan));
   std::printf("  速度更新  %10.3f  %5.1f%%\n", t.velocity * 1e3, pct(t.velocity));
   std::printf("  其它      %10.3f  %5.1f%%\n", (wall - t.predict - t.localStep - t.scatter -
-                                              t.assemble - t.solve - t.velocity) * 1e3,
-              pct(wall - t.predict - t.localStep - t.scatter - t.assemble - t.solve - t.velocity));
+                                              t.assemble - t.solve - t.unpackScan - t.velocity) * 1e3,
+              pct(wall - t.predict - t.localStep - t.scatter - t.assemble - t.solve - t.unpackScan -
+                  t.velocity));
 
   const auto& st = ctx.solver->stats();
   std::printf("\n--- 分解复用（方向 1 的核心）---\n");
