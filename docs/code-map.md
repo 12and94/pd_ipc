@@ -110,7 +110,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
 | `core/sim/Integrator.h` | `stepOnce` / `stepFrame` / `surrogateEnergy` / `totalEnergy` / `maxSpeed` | 2、3、5、6 |
-| `core/sim/Integrator.cpp` | `stepOnce()` 的流程（**Phase 1 之后：一个子步只进入一个并行区域**，见 `docs/parallel-refactor.md` §4.1），按阶段编号：<br>**1) 判定+数值分解**（区域外，串行）——只在 stamp 变化时执行<br>**2) 预测** $\hat x=x+hv+h^2g$（区域内的 `omp for`；**融合**了"保存上一步位置"与"初始化 previous"）——**重力只在这里出现一次**<br>**3) 惯性右端** $b_{\text{base}}=(M/h^2)\hat x$（`omp single`）<br>**4) PD 迭代**：局部步(`projectInRegion`) → 散射(`scatterIntoInRegion`，融合了基值) → 覆盖 pin+全局回代（同一个 `single`） → 解包+收敛扫描+previous（融合成一趟，`omp for nowait` + 每线程部分最大值） → 判据+残差（`omp single`；残差是串行算法）<br>**5) 速度更新与阻尼**（`omp for nowait`） | 2、3、5、6 |
+| `core/sim/Integrator.cpp` | `stepOnce()` 的流程（**Phase 1 之后：一个子步只进入一个并行区域**，见 `docs/parallel-refactor.md` §4.1），按阶段编号：<br>**1) 判定+数值分解**（区域外，串行）——只在 stamp 变化时执行<br>**2) 预测** $\hat x=x+hv+h^2g$（区域内的 `omp for`；**融合**了"保存上一步位置"与"初始化 previous"）——**重力只在这里出现一次**<br>**3) 惯性右端** $b_{\text{base}}=(M/h^2)\hat x$（`omp single`）<br>**4) PD 迭代**：局部步(`projectInRegion`) → 散射(`scatterIntoInRegion`，融合了基值) → 覆盖 pin+全局回代（同一个 `single`） → 解包+收敛扫描+previous+**非线性残差**（融合成一趟，`omp for nowait` + 每线程部分最大值；**Phase 3 之后残差是逐顶点 gather，不再是串行趟**，见 `docs/perf.md` §7） → 判据（`omp single`，只做合并与判定）<br>**5) 速度更新与阻尼**（`omp for nowait`） | 2、3、5、6 |
 
 > **说明**：目前形式是 $v_{n+1}=(1-k_d)(x_{n+1}-x_n)/h$。
 > 重力只通过第 1 阶段的 $\hat x=x+hv+h^2g$ 进入，右端**不需要**再补外力项

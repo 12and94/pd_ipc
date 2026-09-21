@@ -137,6 +137,84 @@ Scalar nonlinearResidual(const SimContext& ctx) {
   return worst;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3：残差的**逐顶点 gather** 版本（上面 nonlinearResidual 是它的串行对照）
+//
+// 为什么这里可以用 gather（而散射那边 gather 只是平手）：
+//   · 散射写的是 b 的 3 个槽位，gather 要求"每个顶点只写自己的槽位" —— 散射本来
+//     就是 scatter（一个顶点被多条边写），gather 化必须把"逐边投影"改成"逐顶点重算
+//     投影"，多算一遍投影，换到的只是少几个 barrier。实测平手（docs/perf.md §3.4）。
+//   · 残差本来就是 **O(顶点数) 的结果**（每顶点一个 r_i，再取 max），gather 与它的
+//     数据流同形：顶点读自己的关联边、只写自己的局部量，天然无冲突、无归约、
+//     位级可复现（求和顺序由 CSR 决定，与线程数/分块无关）。
+//
+// 与 nonlinearResidual 的关系：**同一口径**（同一公式、同一投影、同一退化保护）。
+// 求和顺序也一致 —— 关联表（CSR）是**按边号升序**填的（buildAdjacency 用 cursor 顺序遍历
+// 边表），所以"顶点 v 的关联边序"与"串行版按全局边序累加进 force[v]"是同一个顺序，
+// 两者**逐位相同**（实测 40×40、8 次迭代/子步，无一处偏差）。
+// PD_DEBUG_RESIDUAL=1 时 stepOnce 会把两个值都算出来做自查（见那里的 1e-9 告警）。
+//
+// 端点位置一律从 xSolution 取，而**不是** m.positions：xSolution 是刚做完的回代结果，
+// 而 m.positions 要等"解包趟"写回。用 xSolution 就不存在"邻居还没解包"的读序依赖，
+// 于是残差能与解包融合在**同一趟**里 —— 这是本次改造省下的主要成本
+// （原来残差是 single 里的串行趟，且要它自己的一趟全边遍历）。
+// 两者数值上完全一致：解包趟写的就是 m.positions[i] = xSolution[i]（含 pinned 行，
+// pin 行的解被 applyPinRhs 覆盖为 q，因此 pinned 端点用 xSolution 读到的也还是 q）。
+inline Scalar vertexResidual(const Mesh& mesh, const ConstraintColoring& adj, const Scalar* xSol,
+                             const std::vector<Vec3>& predicted, Scalar mass, Scalar invH2, int v) {
+  const std::size_t i = static_cast<std::size_t>(v);
+  Vec3 force{0, 0, 0};
+  const std::size_t begin = adj.vertexStart[i];
+  const std::size_t end = adj.vertexStart[i + 1];
+  for (std::size_t k = begin; k < end; ++k) {
+    const Edge& e = mesh.edges[adj.vertexEdges[k]];
+    const Scalar* pa = xSol + static_cast<std::size_t>(e.a) * 3;
+    const Scalar* pb = xSol + static_cast<std::size_t>(e.b) * 3;
+    const Vec3 rel{pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]};  // A_c x
+    const Scalar len = length(rel);
+    // d_c 就地按当前位置重算（不能复用 ctx.targets：那是最后一次迭代**开始前**的投影，
+    // 提前退出时已过期，会算出远小于真值的假阴性 —— 见 nonlinearResidual 顶部那段）。
+    const Vec3 d = (len <= DistanceTerm::kMinLength) ? Vec3{} : rel * (e.restLength / len);
+    // 与 nonlinearResidual 逐字同形：两个乘法再相减（不写成 (rel-d)*κ，
+    // 那样会多引入一次舍入，让"两个口径"的差从纯求和顺序差异变成额外的乘法顺序差异）。
+    const Vec3 contrib = rel * e.stiffness - d * e.stiffness;  // κ(A_c x − d_c)
+    if (e.a == v) {
+      force += contrib;
+    } else {
+      force -= contrib;
+    }
+  }
+  const Vec3 xv{xSol[3 * i + 0], xSol[3 * i + 1], xSol[3 * i + 2]};
+  const Vec3 inertia = (xv - predicted[i]) * (mass * invH2);
+  return length(inertia + force) / mass;
+}
+
+// 关联表（CSR）契约自查：**一次/子步**，放在进并行区域之前。
+//
+// 为什么不在散射里查（DistanceTerm::checkColoringContract 的邻居位置显然更方便）：
+// 实测把这段 O(1) 校验放进 `scatterIntoInRegion` 会让 1 线程的散射阶段
+// 100–104 ms → 128–133 ms（**+28 %**，12,000 次调用/300 子步）—— 开销与"几条指令"
+// 完全不相称，说明是编译器的代码布局被扰动（详见 DistanceTerm.cpp 末尾那段注记）。
+// 而关联表的唯一使用者就是下面的残差 gather，所以由它自己保证前置条件最合适：
+// 错了就在**进区域之前**报错，不会出现"跑到一半才发现越界"。
+void checkAdjacencyContract(const Mesh& mesh) {
+  const ConstraintColoring& coloring = mesh.constraintColoring();
+  const std::size_t n = mesh.positions.size();
+  if (coloring.vertexStart.size() == n + 1 &&
+      coloring.vertexEdges.size() == static_cast<std::size_t>(mesh.edgeCount()) * 2) {
+    return;
+  }
+  std::fprintf(stderr,
+               "[residual] 违反前置条件：顶点关联表已过期 —— vertexStart %zu 项（期望 %zu）、"
+               "vertexEdges %zu 项（期望 %zu）。\n"
+               "  残差的 gather 用它当循环边界，规模不对就是越界读（实测表现为卡住不返回）。\n"
+               "  改了拓扑（增删边/改顶点数）之后必须重新调用 Mesh::buildSparsityPattern()。\n",
+               coloring.vertexStart.size(), n + 1, coloring.vertexEdges.size(),
+               static_cast<std::size_t>(mesh.edgeCount()) * 2);
+  std::fflush(stderr);
+  std::abort();
+}
+
 void resetStageTimes(SimContext& ctx) { ctx.times = StageTimes{}; }
 
 int stepOnce(SimContext& ctx) {
@@ -146,6 +224,9 @@ int stepOnce(SimContext& ctx) {
   const SceneConfig& cfg = ctx.config;
   const Scalar h = cfg.dt;
   const Scalar invH = 1.0 / h;
+  // 与 nonlinearResidual 里**逐字同形**（1/(h·h) 而不是 invH·invH）：后者是另一种舍入，
+  // 会让"串行/并行残差"的对照凭空多出一个 1 ulp 的差，掩盖真正的求和顺序差异。
+  const Scalar invH2 = 1.0 / (h * h);
   const int n = m.vertexCount();
   const std::size_t dim = static_cast<std::size_t>(3 * n);
 
@@ -155,6 +236,7 @@ int stepOnce(SimContext& ctx) {
   // 约束着色的懒构建兜底（幂等、O(1) 检查）：**必须在进并行区域之前**做，
   // 否则会在区域里"一边建一边被别的线程读"。正常路径由 buildSparsityPattern 建好。
   m.ensureConstraintColoring();
+  checkAdjacencyContract(m);  // 残差 gather 的前置条件（一次/子步，不进每迭代热路径）
 
   // ---------------------------------------------------------------
   // 2) 判定是否需要重新组装 + 数值分解（区域外：它是串行工作，且必须先于迭代）。
@@ -220,6 +302,26 @@ int stepOnce(SimContext& ctx) {
   const int mergeSlots = std::max(1, numThreads());
   std::vector<Scalar> partialDiff(static_cast<std::size_t>(mergeSlots), 0.0);
   std::vector<Scalar> partialScale(static_cast<std::size_t>(mergeSlots), 0.0);
+  // 残差也一样是"每线程部分最大值 + 固定顺序合并"（max 精确且可结合）。
+  // 额外带一个"取到最大值的顶点号"槽位，用于 PD_DEBUG_RESIDUAL 的逐项分解；
+  // 相同残差时取**更小**的顶点号（各线程槽位按线程号升序合并 ⇒ 与线程数无关）。
+  std::vector<Scalar> partialResidual(static_cast<std::size_t>(mergeSlots), 0.0);
+  std::vector<int> partialResidualVertex(static_cast<std::size_t>(mergeSlots), -1);
+
+  // 残差要**并行算**的条件：判据启用了，或开了调试口径。
+  // 调试口径（PD_DEBUG_RESIDUAL）需要 worst 顶点的 force[] 逐项分解，串行版顺手就有；
+  // 为了不让并行路径为调试多背一份全量 force 缓冲，调试运行里报告串行值、并行值只作对照。
+  const bool debugRes = debugResidual();
+  const bool wantResidual = (cfg.residualTolerance > 0.0) || debugRes;
+  // 两条残差路径的**选择**（不是两个定义 —— 两者数值逐位相同，见 vertexResidual 顶部）：
+  //   · 区域内并行时：逐顶点 gather，与解包趟融合（一份工作量摊到 4 个线程上，最快）；
+  //   · 区域被 `if` 子句串行化时（单线程 / 小网格）：边序串行版。它每条边只算一次投影，
+  //     而 gather 版要让两个端点各算一次 —— 串行时没人替它摊掉这笔多出来的 √与除法，
+  //     实测 40×40 会白掉 6.5 %（6.010 → 6.403 ms/子步）。既然两者结果逐位相同，
+  //     就没有理由让串行路径去付这笔钱。
+  //   · 调试时**两条都算**并互相校对（1e-9 告警），所以此时不受上面这条选择影响。
+  const bool gatherResidual = wantResidual && (useParallel || debugRes);
+  const bool serialResidual = wantResidual && (!useParallel || debugRes);
 
   ctx.converged = false;  // 本子步是否达到收敛判据（而非用尽迭代预算）
   ctx.iterationsUsed = 0;
@@ -291,16 +393,25 @@ int stepOnce(SimContext& ctx) {
         }
       }
 
-      // 4f) 解包 + 收敛扫描 + previous 更新（逐顶点融合成一趟）
+      // 4f) 解包 + 收敛扫描 + previous 更新 + **非线性残差**（逐顶点融合成一趟）
       //
       //     部分值用**区域内声明的变量**（每线程私有），再写进共享槽位后统一合并 ——
       //     max 是精确运算，合并顺序不影响结果，因此与串行扫描逐位相同。
       //
       //     scale 的定义：取"本子步已发生的位移量级"，
       //     而不是坐标量级 —— 后者会让判据失去平移不变性、并在高刚度下过早放行。
+      //
+      //     残差为什么能塞进这一趟：它逐顶点 gather（见 vertexResidual），端点位置
+      //     取 xSolution —— 与这一趟写的 m.positions[i] 是同一个值，所以"邻居还没解包"
+      //     不构成读序依赖，不需要额外的 barrier。这取代了原来 single 里的串行整趟
+      //     O(E) 遍历（那是 Phase 3 要消掉的最后一块串行工作）。
       Scalar localDiff = 0.0;
       Scalar localScale = 0.0;
+      Scalar localResidual = 0.0;
+      int localResidualVertex = -1;
       const auto tScan = Clock::now();
+      const Scalar* xSol = ctx.xSolution.data();
+      const ConstraintColoring& adj = m.constraintColoring();
 #ifdef _OPENMP
 #pragma omp for nowait
 #endif
@@ -311,11 +422,29 @@ int stepOnce(SimContext& ctx) {
         localDiff = std::max(localDiff, maxAbsComponent(xNew - previous[i]));
         localScale = std::max(localScale, maxAbsComponent(ctx.predicted[i] - ctx.positionsBeforeStep[i]));
         previous[i] = xNew;
+
+        if (gatherResidual) {
+          const Scalar mass = m.masses[i];
+          // 与串行版同样的跳过条件：pinned 顶点不是未知量（其行被整行覆盖），
+          // 零质量顶点不参与（除零）。
+          if (!m.isPinned(static_cast<int>(v)) && mass > 0.0) {
+            const Scalar r = vertexResidual(m, adj, xSol, ctx.predicted, mass, invH2,
+                                            static_cast<int>(v));
+            // 严格大于：相同残差时保留更小顶点号（与合并顺序共同保证确定性）。
+            if (r > localResidual) {
+              localResidual = r;
+              localResidualVertex = static_cast<int>(v);
+            }
+          }
+        }
       }
 #ifdef _OPENMP
       if (threadId() < mergeSlots) {
-        partialDiff[static_cast<std::size_t>(threadId())] = localDiff;
-        partialScale[static_cast<std::size_t>(threadId())] = localScale;
+        const std::size_t slot = static_cast<std::size_t>(threadId());
+        partialDiff[slot] = localDiff;
+        partialScale[slot] = localScale;
+        partialResidual[slot] = localResidual;
+        partialResidualVertex[slot] = localResidualVertex;
       }
       // 显式 barrier：上面的槽位必须全部写完，下面才算得对。
 #pragma omp barrier
@@ -324,9 +453,18 @@ int stepOnce(SimContext& ctx) {
       {
         Scalar diff = 0.0;
         Scalar scale = 0.0;
+        Scalar residualParallel = 0.0;
+        int residualVertex = -1;
         for (int t = 0; t < mergeSlots; ++t) {
           diff = std::max(diff, partialDiff[static_cast<std::size_t>(t)]);
           scale = std::max(scale, partialScale[static_cast<std::size_t>(t)]);
+          // 合并规则：取更大的残差；相等时取更小的顶点号（槽位按线程号升序）。
+          const Scalar r = partialResidual[static_cast<std::size_t>(t)];
+          const int rv = partialResidualVertex[static_cast<std::size_t>(t)];
+          if (rv >= 0 && (r > residualParallel || (r == residualParallel && residualVertex < 0))) {
+            residualParallel = r;
+            residualVertex = rv;
+          }
         }
         scale = std::max(scale, length(cfg.gravity) * h * h);
         const Scalar rel = (scale > 0.0) ? diff / scale : diff;
@@ -342,16 +480,28 @@ int stepOnce(SimContext& ctx) {
         // 而单步位移看起来已经很小）。
         // 注意：调试开关 PD_DEBUG_RESIDUAL 要求**即使判据关闭也要计算残差**，
         // 否则"关掉判据"的对照运行里就看不到残差读数了。
-        // 残差是串行算法（内部用静态缓冲），因此只能在 single 里跑。
-        Scalar residual = -1.0;
+        Scalar residual = gatherResidual ? residualParallel : Scalar{-1};
         bool resHit = false;
-        const bool wantResidual = (cfg.residualTolerance > 0.0) || debugResidual();
-        if (wantResidual) {
-          residual = nonlinearResidual(ctx);
-          if (cfg.residualTolerance > 0.0) {
-            const Scalar gScale = std::max<Scalar>(length(cfg.gravity), 1.0e-12);
-            resHit = (residual <= cfg.residualTolerance * gScale);
+        if (serialResidual) {
+          // 串行口径（边序累加，每条边只算一次投影）。调试时它还会打印 worst 顶点的逐项分解，
+          // 并且此时并行口径也被算了出来 ⇒ 顺手做一次两口径自查。
+          const Scalar serial = nonlinearResidual(ctx);
+          if (gatherResidual && serial != residual) {
+            const Scalar mag = std::max(std::fabs(serial), std::fabs(residual));
+            const Scalar deviation = (mag > 0.0) ? std::fabs(serial - residual) / mag : 0.0;
+            if (deviation > 1e-9) {
+              std::fprintf(stderr,
+                           "[residual] 口径不一致：串行 %.9e 并行 %.9e（相对差 %.2e，"
+                           "并行的 worst 顶点 %d）\n"
+                           "  两者应逐位相同；不一致说明某一边被改坏了。\n",
+                           serial, residual, deviation, residualVertex);
+            }
           }
+          residual = serial;
+        }
+        if (cfg.residualTolerance > 0.0) {
+          const Scalar gScale = std::max<Scalar>(length(cfg.gravity), 1.0e-12);
+          resHit = (residual <= cfg.residualTolerance * gScale);
         }
         ctx.lastResidual = residual;
         // 这一趟的时间含 barrier 等待（所有线程都要到齐才算完），因此是"该阶段的墙钟"。

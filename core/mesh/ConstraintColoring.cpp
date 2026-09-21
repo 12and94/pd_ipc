@@ -30,39 +30,33 @@ inline uint32_t priorityOf(uint32_t edgeIndex) {
   return static_cast<uint32_t>(x >> 32);
 }
 
-/// 顶点 → 关联边（CSR，拓扑级）。
-struct VertexEdgeAdjacency {
-  std::vector<uint32_t> start;  ///< 大小 vertexCount+1
-  std::vector<uint32_t> edges;
-};
-
-VertexEdgeAdjacency buildAdjacency(const Mesh& mesh) {
+/// 顶点 → 关联边（CSR，拓扑级）：写进 ConstraintColoring 复用同一份缓存
+/// （着色用它做冲突判定；散射的 gather 路径用它做"每个顶点读自己的关联边"）。
+void buildAdjacency(const Mesh& mesh, ConstraintColoring& out) {
   const int nv = mesh.vertexCount();
   const int ne = mesh.edgeCount();
-  VertexEdgeAdjacency adj;
-  adj.start.assign(static_cast<std::size_t>(nv) + 1, 0);
+  out.vertexStart.assign(static_cast<std::size_t>(nv) + 1, 0);
 
   for (const Edge& e : mesh.edges) {
-    adj.start[static_cast<std::size_t>(e.a) + 1] += 1;
-    adj.start[static_cast<std::size_t>(e.b) + 1] += 1;
+    out.vertexStart[static_cast<std::size_t>(e.a) + 1] += 1;
+    out.vertexStart[static_cast<std::size_t>(e.b) + 1] += 1;
   }
   for (int v = 0; v < nv; ++v) {
-    adj.start[static_cast<std::size_t>(v) + 1] += adj.start[static_cast<std::size_t>(v)];
+    out.vertexStart[static_cast<std::size_t>(v) + 1] += out.vertexStart[static_cast<std::size_t>(v)];
   }
-  adj.edges.assign(static_cast<std::size_t>(2) * static_cast<std::size_t>(ne), 0);
-  std::vector<uint32_t> cursor(adj.start.begin(), adj.start.end() - 1);
+  out.vertexEdges.assign(static_cast<std::size_t>(2) * static_cast<std::size_t>(ne), 0);
+  std::vector<uint32_t> cursor(out.vertexStart.begin(), out.vertexStart.end() - 1);
   for (int i = 0; i < ne; ++i) {
     const Edge& e = mesh.edges[static_cast<std::size_t>(i)];
-    adj.edges[cursor[static_cast<std::size_t>(e.a)]++] = static_cast<uint32_t>(i);
-    adj.edges[cursor[static_cast<std::size_t>(e.b)]++] = static_cast<uint32_t>(i);
+    out.vertexEdges[cursor[static_cast<std::size_t>(e.a)]++] = static_cast<uint32_t>(i);
+    out.vertexEdges[cursor[static_cast<std::size_t>(e.b)]++] = static_cast<uint32_t>(i);
   }
-  return adj;
 }
 
 /// 边 e 的两个端点上的关联边（用于冲突判定）。
 struct NeighborScanner {
   const Mesh& mesh;
-  const VertexEdgeAdjacency& adj;
+  const ConstraintColoring& adj;
 
   /// 遍历 e 的所有邻居（跳过自身）。
   template <typename Fn>
@@ -70,8 +64,8 @@ struct NeighborScanner {
     const Edge& edge = mesh.edges[e];
     const uint32_t endpoints[2] = {static_cast<uint32_t>(edge.a), static_cast<uint32_t>(edge.b)};
     for (const uint32_t v : endpoints) {
-      for (uint32_t k = adj.start[v]; k < adj.start[v + 1]; ++k) {
-        const uint32_t f = adj.edges[k];
+      for (uint32_t k = adj.vertexStart[v]; k < adj.vertexStart[v + 1]; ++k) {
+        const uint32_t f = adj.vertexEdges[k];
         if (f != e) fn(f);
       }
     }
@@ -92,13 +86,16 @@ void buildConstraintColoring(const Mesh& mesh, ConstraintColoring& out) {
   out.order.clear();
   out.colorCount = 0;
   out.built = true;
+  // **邻接表必须在提前返回之前建好**：0 条边的网格（例如 pd_check 的"自由落体单顶点"）
+  // 也要求 vertexStart 有 vertexCount+1 个零 —— 否则散射的 gather 循环会把越界读到的
+  // 垃圾当上界，表现为"跑不完"而不是崩溃（这个坑实际踩到过：pd_check 卡死 90 s+）。
+  buildAdjacency(mesh, out);
   if (ne <= 0) {
     out.start.push_back(0);
     return;
   }
 
-  const VertexEdgeAdjacency adj = buildAdjacency(mesh);
-  const NeighborScanner scan{mesh, adj};
+  const NeighborScanner scan{mesh, out};
 
   std::vector<uint32_t> prio(static_cast<std::size_t>(ne));
   for (int i = 0; i < ne; ++i) prio[static_cast<std::size_t>(i)] = priorityOf(static_cast<uint32_t>(i));

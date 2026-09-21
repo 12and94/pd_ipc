@@ -67,6 +67,16 @@ void checkColoringContract(const Mesh& mesh) {
     std::fflush(stderr);
     std::abort();
   }
+  // 关联表（CSR）的规模校验**不在这里**做。
+  //
+  // 原因是一条实测（很反直觉，务必保留）：把"vertexStart/vertexEdges 规模对不对"这种
+  // O(1) 校验加进本函数，会让 MSVC 重新安排 scatter 循环的代码布局 ——
+  // 40×40 / 300 子步 / 40 迭代（12,000 次散射调用）实测散射阶段
+  // **100–104 ms → 128–133 ms（+28 %）**，而"多出来的指令"本身只有几条、
+  // 与增量完全不相称（1T 总时间 +4 %，4T 看不到差别）。
+  // 结论：本函数在**每次迭代**都被调用，任何改动都可能被编译器的布局变化放大。
+  // 关联表校验因此挪到 `stepOnce` 里**一次/子步**的位置
+  //（`checkAdjacencyContract`，见 Integrator.cpp），只由它的唯一使用者（残差的 gather）负责。
 }
 
 /// 投影的核心（一条边）：Π_c(A_c x) = ℓ·unit(x_a − x_b)。

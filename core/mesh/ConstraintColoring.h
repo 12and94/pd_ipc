@@ -38,6 +38,12 @@ struct ConstraintColoring {
   /// "是否需要构建"，才能让懒构建的检查恒为 O(1) 且不重复构建。
   bool built = false;
 
+  /// 顶点 → 关联边（CSR，拓扑级）。着色用它做冲突判定；
+  /// **散射的 gather 路径也用它**（每个顶点读自己的关联边、只写自己的槽位）。
+  /// 放这里是因为两者生命周期完全相同（都只依赖拓扑），共享一份缓存与失效规则。
+  std::vector<uint32_t> vertexStart;   ///< 大小 vertexCount+1
+  std::vector<uint32_t> vertexEdges;   ///< 每条关联边出现两次（两端各一次）
+
   /// 有没有颜色类可用（0 条边时为 false，散射的逐色循环会自然跳过）。
   bool empty() const { return colorCount <= 0; }
 
