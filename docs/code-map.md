@@ -1,7 +1,8 @@
 # 代码地图与验证方法
 
 > 本文档只讲两件事：**每部分代码在哪**、**怎么运行并看结果**。
-> 计划与设计见 `docs/plan.md`，进度与现象记录见 `README.md`。
+> 计划与设计见 `docs/plan.md`，进度与现象记录见 `README.md`，
+> **收敛问题的成因与刚度标定见 `docs/pd-convergence.md`**。
 
 ---
 
@@ -145,7 +146,8 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 # ---- 测试套件（打印每条断言）----
 .\build\Release\test_primitives.exe         # 68 断言（12 个测试）
-.\build\Release\test_spring_vertical.exe    # 139 断言（8 个测试）
+.\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
+.\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
 
 # ---- 专项验证 ----
 .\build\Release\pd_diraudit.exe       # 投影方向：全局一致性 / 物理合理性 / 标准 PD 一致性
@@ -194,10 +196,13 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 | `pd_trans` | 平移一致性：pin 在任意位置下静止位移严格为 0；平移系统后相对形状不变 | 全过 |
 | `pd_chain` | 长链条对照解析解：自由链长度精确不变；悬挂链伸长与 $mg\,N(N-1)/(2\kappa)$ 吻合 | 全过 |
 | `pd_diraudit` | 方向三项：全局一致 / 物理合理 / 与标准 PD 逐位一致 | 全过 |
-| `test_primitives` + `test_spring_vertical` | 68 + 139 断言 | 全绿 |
+| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | 68 + 155 + 15 断言 | 全绿 |
 
 **实测性能**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束）
-查看器 `--frames 600` 平均 59.4 FPS（vsync 封顶）、稳态物理 1.52 ms/帧，数值分解全程只发生 1 次。
+查看器 `--frames 400` 实测 60 FPS（vsync 封顶）、稳态物理 1.9 ms/帧、迭代 1 次、
+应变 1%、数值分解全程只发生 1 次。（数字为 2026-09-20 刚度标定后的复测；
+标定前记录为"59.4 FPS / 1.52 ms/帧"，那组数字来自会过早退出迭代的旧判据，
+可比性有限 —— 见 `docs/pd-convergence.md`。）
 
 **已知不足**（不是缺陷，是尚未实现）：
 

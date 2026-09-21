@@ -42,6 +42,13 @@ void printUsage() {
 
 int main(int argc, char** argv) {
   SceneConfig cfg;
+  // 基准的刚度**显式固定**，不跟随 SceneConfig 的标定默认值。
+  // 原因：SceneConfig 默认 κ≈2300 是按 60×60（布长 1.18 m）标定到 ε≈1% 的；
+  // 本基准默认网格 40×40（布长 0.78 m）受力更小，同一个 κ 会给出 ε≈15%
+  // 且不收敛（实测迭代 10/40/100/400 全部撞满、应变恒定在 0.15）。
+  // 基准要的是"可复现的固定工况"，故把 κ 定在 40×40 下 ε≈1% 的 1e4，
+  // 并保留 --stiffness 覆盖。
+  cfg.stiffness = 1.0e4;
   int steps = 600;
   int threads = 0;
   bool pinAll = false;

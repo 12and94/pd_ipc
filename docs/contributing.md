@@ -114,7 +114,8 @@ $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
    - 投影在退化/极端位形下的行为（定义清楚是跳过、钳制还是报错）；
    - `assemble` 出的块与**梯度**的有限差分一致（误差阈值写进测试）；
 3. 在解析解或已知不变量下对照（例如刚性平移/旋转不激发内能）；
-4. 通过后才接入场景与回归，并在 `docs/perf.md` 补上新的耗时占比；
+4. 通过后才接入场景与回归，并在 `docs/perf.md` 补上新的耗时占比
+   （该文件尚未创建 → 暂记 `README.md` §3.5）；
 5. 若该约束需要新的全局步策略（例如需要进矩阵的接触项），先在 `docs/plan.md` §7 决策记录里加一条，并说明它如何影响 `SolverStamp` 的失效条件。
 
 ---
@@ -125,3 +126,6 @@ $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
 - 报告格式：预热 100 帧后统计 600 帧的均值 / P95 / 最大值，分阶段列出耗时与占比。
 - 线程数按 1 / 2 / 4 / 8 / 16 呈现；**不假设线性加速**（本机 20 逻辑核含 4 个 E-core）。
 - 每次触及热路径的改动都要更新 `docs/perf.md`，并在提交信息中附上前后对比。
+  > **注意：`docs/perf.md` 目前尚未创建**（M2 的产物，见 `docs/plan.md` §3）。
+  > 在它存在之前，性能数字请写进 `README.md` §3.5，并注明测量工况。
+  > 已落地的性能与收敛记录见 `README.md` §3.5 与 `docs/pd-convergence.md`。

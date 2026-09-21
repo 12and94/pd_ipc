@@ -238,7 +238,12 @@ y^\star=\frac{m\,\hat y_1+k h^2\ell}{m+k h^2}$$
 
 **为什么这个实验特别有价值**：它是全项目里唯一一个"**每个中间量都能手算**"的系统（位置、投影、右端、矩阵、不动点全是一维标量），因此它同时充当 (a) 单位一致性与符号约定的检查、(b) 矩阵装配的检查（$(1+c)$ 这个分母只能由正确的对角块 + pinned 行给出）、(c) 时间积分格式的检查（$h^2g$ 的系数）、(d) 收敛判据的检查。**M1 完成后第一个跑的实验就是它，M1.5 链路门把它作为第 0 项前置。**
 
-**权重**：$w_c=\kappa_c$（能量系数，**不除以** $(w_i+w_j)$、**不除以**平均邻接度——两者都会让约束刚度偏离设定值若干数量级）。全局刚度尺度用 $\kappa = k_{\text{stretch}}$（**默认 1e4 是拍的值，尚未标定**：标定是 M1.5 的产物，见 §3）。
+**权重**：$w_c=\kappa_c$（能量系数，**不除以** $(w_i+w_j)$、**不除以**平均邻接度——两者都会让约束刚度偏离设定值若干数量级）。全局刚度尺度用 $\kappa = k_{\text{stretch}}$。
+> **标定已完成（2026-09-20）**：默认值由"拍的 1e4"改为按物理应变标定的 **κ≈2300**
+> （60×60、间距 0.02、密度 1 下对应顶端应变 ε≈1%）。标定依据、质量口径依赖、
+> 以及标定前高刚度下"外层迭代不收敛"这一缺陷的完整成因见 `docs/pd-convergence.md`。
+> **注意**：κ 与网格尺度强相关（ε 取决于受力与边长），换网格需重标定；
+> `pd_bench` 因此在代码里显式固定自己的 κ，不跟随该默认值。
 
 #### 2.2.3 后续追加（链路验证通过后，按此顺序）
 
@@ -606,7 +611,9 @@ pd_ipc/
     physics_regression/   invariants/  stability_sweep/  determinism/
   bench/                 sweep.ps1、场景数据、性能表生成脚本
   tools/                 vk_probe.cpp（环境能力探查，已存在）
-  docs/                  plan.md  environment.md  design-discussion.md  contributing.md  perf.md
+  docs/                  plan.md  environment.md  design-discussion.md  contributing.md
+                         code-map.md  pd-convergence.md
+                         perf.md（**尚未创建**，M2 产物；在其存在前性能数字记于 README §3.5）
 ```
 
 **依赖策略（按本机实况）**：本地 **Eigen 3.4.0** + OpenMP（必需）；**doctest 单头**（测试，自行获取）；**GLFW 3.3.8 本地版** + 自绘 HUD（M3，ImGui 需自行获取）；**Vulkan SDK 1.3.290 + glslc**（M5 起，VMA 需自行获取或先不用）。**不引入 vcpkg、不使用 MinGW g++**。核心库 `pd_ipc_core` **不依赖窗口与 Vulkan**，保证 `bench` 与 CI 永远可跑。
