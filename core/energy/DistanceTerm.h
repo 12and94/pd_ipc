@@ -50,6 +50,33 @@ class DistanceTerm {
   /// 调用方需保证 triplets 已清空；本函数只做追加。
   static void assembleMatrix(const Mesh& mesh, const std::vector<Vec3>& /*unused*/,
                              std::vector<Eigen::Triplet<Scalar>>& triplets);
+
+  // ---------------------------------------------------------------------------
+  // 区域内版本（"一个子步一个区域"方案的接口，见 docs/parallel-refactor.md §4.1）
+  //
+  // **契约：必须在已有的 `#pragma omp parallel` 区域内调用。** 它们只做 `omp for`，
+  // 不再自己开区域 —— 这正是把每子步 2K 次 fork/join 降成 1 次的关键。
+  // 在区域外调用属于误用（OpenMP 的孤儿 worksharing 构造行为未定义），
+  // 因此这里不设运行时断言（串行化的区域 omp_in_parallel() 也返回 false，
+  // 设断言会把合法用法误杀）；正确用法由 `Integrator::stepOnce` 与下面的
+  // 独立入口各自保证：独立入口自己开区域，区域内版本由 stepOnce 在区域内调用。
+  //
+  // 为什么保留独立入口（project / scatterInto）：测试、`_verify/` 程序与诊断
+  // 工具都直接调它们，且小网格上不该为一次投影付 fork/join 的代价。
+  // ---------------------------------------------------------------------------
+
+  /// 区域内版本：把投影写进 targets（逐边写，无跨线程依赖）。
+  static void projectInRegion(const Mesh& mesh, std::vector<Vec3>& targets);
+
+  /// 区域内版本：`b[i] = base[i] + Σ_c κ_c (A_c^T d_c)[i]`（含 pin 消元补偿）。
+  ///
+  /// 与 scatterInto 的关系：**求和规则完全相同**（每线程私有全维缓冲 →
+  /// 按线程号升序归约），只是把"拷贝基值 + 归约"合成一趟并行循环；
+  /// 因此逐元素结果与 `b = base; scatterInto(...)` 逐位相同（加法顺序不变）。
+  ///
+  /// base 与 b 必须都能访问 3*vertexCount 个元素且**不重叠**（base 通常是 bBase）。
+  static void scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>& targets,
+                                  const Scalar* base, Scalar* b, std::size_t dim);
 };
 
 }  // namespace pd

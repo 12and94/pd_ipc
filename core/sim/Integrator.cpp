@@ -34,6 +34,14 @@ bool debugResidual() {
   return on;
 }
 
+/// 规模阈值：网格小于它时不上并行。
+/// 依据：区域本身的开关 + 每迭代若干 barrier 在 18 线程下要几十微秒，
+/// 而小网格的每阶段有效工作只有几微秒（实测见 docs/perf.md）。
+/// 这是**经验阈值**，Phase 2（图着色消除归约流量）之后要重新标定 ——
+/// 那时并行的收益区间会往下移动。用 `if` 子句串行化区域而不是复制代码路径，
+/// 是为了保证全项目只有一份流程实现。
+constexpr int kMinParallelWork = 512;
+
 #define PD_TRACE(...)                             \
   do {                                            \
     if (traceEnabled()) {                         \
@@ -139,34 +147,14 @@ int stepOnce(SimContext& ctx) {
   const Scalar h = cfg.dt;
   const Scalar invH = 1.0 / h;
   const int n = m.vertexCount();
+  const std::size_t dim = static_cast<std::size_t>(3 * n);
 
   // 自保护：任何构造路径（makeScene / 测试 / 调试程序）都可能忘记分配缓冲。
   // 这里统一保证尺寸正确，避免越界写（这是实际踩过的坑）。
   ensureBuffers(ctx);
 
-  // 保存本步开始时的位置：速度更新必须用它，而不是从上式反推
-  // （反推会引入一次额外的舍入，速度就不再是"精确的差分"）。
-  ctx.positionsBeforePrevStep = ctx.positionsBeforeStep;
-  ctx.positionsBeforeStep = m.positions;
-
   // ---------------------------------------------------------------
-  // 1) 预测：x̂ = x + h v + h² g
-  //    （曾用环境变量把这一项反号做过符号自检，已移除。）
-
-  // ---------------------------------------------------------------
-  {
-    const auto t0 = Clock::now();
-
-    for (int v = 0; v < n; ++v) {
-      const std::size_t i = static_cast<std::size_t>(v);
-      ctx.predicted[i] = m.positions[i] + m.velocities[i] * h + cfg.gravity * (h * h);
-    }
-    ctx.times.predict += secondsSince(t0);
-  }
-  PD_TRACE("预测完成 x̂[1] = %.12g", (n > 1) ? ctx.predicted[1].y : 0.0);
-
-  // ---------------------------------------------------------------
-  // 2) 判定是否需要重新组装 + 数值分解。
+  // 2) 判定是否需要重新组装 + 数值分解（区域外：它是串行工作，且必须先于迭代）。
   //    正常运行时（拓扑/刚度/h/pin 都没变）这里**一次都不会触发**，
   //    这正是"预分解复用"的收益所在（docs/plan.md §2.3 不变量）。
   // ---------------------------------------------------------------
@@ -195,167 +183,241 @@ int stepOnce(SimContext& ctx) {
   }
 
   // ---------------------------------------------------------------
-  // 3) 右端的惯性部分：b = (M/h²) x̂（保存一份基值，每迭代从它拷贝）
+  // 3)–5) 一个子步 = **一个并行区域**（docs/parallel-refactor.md §4.1）
+  //
+  //   改造前：`#pragma omp parallel` 写在 project / scatterInto **函数内部**，
+  //   于是每子步要 fork/join 2×K 次（K = 迭代数；40 迭代 → 80 次），
+  //   而每次区域开关在 18 线程下要 10–25 µs，比局部步的有效工作还贵。
+  //   现在：整个子步只进/出区域一次，各阶段用区域内的 `omp for` 分工，
+  //   同步成本从"fork/join"降到"barrier"。
+  //
+  //   依赖边界（哪能省 barrier、哪必须同步，逐条都给理由）：
+  //     · 预测 → 惯性右端：靠右端的 single 隐式 barrier 同步；
+  //     · 惯性右端 → 散射(以 bBase 为基值)：同上，single 的 barrier 已保证；
+  //     · 局部步 → 散射：散射内部的 single（清缓冲）带隐式 barrier；
+  //     · 散射 → pin 覆盖 / 回代：散射的归约趟是 `omp for`（带隐式 barrier）；
+  //     · 回代 → 解包+判据：pin 覆盖与回代合在同一个 single 里，其 barrier 覆盖；
+  //     · 迭代末尾：判据 single 的 barrier 让所有线程看到同一个 `ctx.converged`，
+  //       因此 `break` 在所有线程上一致（OpenMP 要求如此）。
+  //
+  //   小网格不上并行：区域本身的开销会超过收益（实测见 docs/perf.md）。
+  //   用 `if` 子句把区域"串行化"，而不是再复制一条串行代码路径 ——
+  //   这样全项目只有一份流程实现（决策：不做运行时双实现开关）。
   // ---------------------------------------------------------------
-  assembleInertialRhs(m, ctx.predicted, h, cfg.velocityDamping, ctx.bBase);
+  std::vector<Vec3> previous(static_cast<std::size_t>(n));
+  const bool useParallel =
+      (numThreads() > 1) && (n >= kMinParallelWork) && (m.edgeCount() >= kMinParallelWork);
 
-  // ---------------------------------------------------------------
-  // 4) PD 迭代：局部步 → 散射 → 覆盖 pin → 全局步
-  // ---------------------------------------------------------------
-  std::vector<Vec3> previous = m.positions;
-  int usedIterations = 0;
+  // 收敛扫描的"每线程部分最大值"槽位（共享，区域外分配）。
+  // 为什么不用 `reduction(max:...)`：MSVC 的经典 OpenMP 2.0 只支持
+  // +,*,−,&,^,|,&&,|| 这些运算符，max/min 要 /openmp:llvm 才认（编译器明确报 C7660）。
+  // 本阶段**刻意不换运行时** —— 换运行时（vcomp → libomp）会同时改变线程池行为，
+  // 那样就分不清"结构改造的收益"与"运行时的差异"了（换运行时留给 Phase 4 单独评估）。
+  // max 是精确且可结合的运算，因此"每线程部分值 + 固定顺序合并"与串行扫描**逐位相同**。
+  const int mergeSlots = std::max(1, numThreads());
+  std::vector<Scalar> partialDiff(static_cast<std::size_t>(mergeSlots), 0.0);
+  std::vector<Scalar> partialScale(static_cast<std::size_t>(mergeSlots), 0.0);
+
   ctx.converged = false;  // 本子步是否达到收敛判据（而非用尽迭代预算）
+  ctx.iterationsUsed = 0;
 
-  for (int k = 0; k < cfg.maxIterations; ++k) {
-    // 4a) 局部步：逐约束独立闭式投影（可并行，无耦合）
+#ifdef _OPENMP
+#pragma omp parallel num_threads(numThreads()) if (useParallel)
+#endif
+  {
+    // ---------------------------------------------------------------
+    // 3) 预测：x̂ = x + h v + h² g
+    //    与"保存上一步位置""初始化 previous"融合成一趟（逐顶点，都是只写自己）。
+    //    重力只在这里出现一次。
+    // ---------------------------------------------------------------
     {
       const auto t0 = Clock::now();
-      DistanceTerm::project(m, ctx.targets);
-      ctx.times.localStep += secondsSince(t0);
-    }
-
-    // 4b) 右端 = 惯性基值 + 约束散射
-    ctx.b = ctx.bBase;
-    {
-      const auto t0 = Clock::now();
-      DistanceTerm::scatterInto(m, ctx.targets, ctx.b.data(), static_cast<std::size_t>(ctx.b.size()));
-      ctx.times.scatter += secondsSince(t0);
-    }
-
-    PD_TRACE("迭代 %d: bBase[4]=%.12g  b[4]=%.12g  L(4,4)=%.12g  L(4,1)=%.12g", k + 1,
-             ctx.bBase.size() > 4 ? ctx.bBase[4] : 0.0, ctx.b.size() > 4 ? ctx.b[4] : 0.0,
-             (ctx.L.rows() > 4 && ctx.L.cols() > 4) ? ctx.L.coeff(4, 4) : 0.0,
-             (ctx.L.rows() > 4 && ctx.L.cols() > 1) ? ctx.L.coeff(4, 1) : 0.0);
-
-    // 4c) 覆盖 pinned 行（pinned 位置严格等于把手位置）
-    applyPinRhs(m, ctx.b);
-
-    // 4d) 全局步：一次回代（矩阵不变，分解已复用）
-    {
-      const auto t0 = Clock::now();
-      ctx.solver->solve(ctx.b, ctx.xSolution);
-      ctx.times.solve += secondsSince(t0);
-    }
-    unpackPositions(ctx.xSolution, m.positions);
-
-    // 4e) 收敛判据：以**本子步已发生的位移量级**为参照
-    //
-    //     scale = max( max|x̂ - xⁿ|∞ , h²|g| )
-    //
-    //     语义："本次迭代造成的位移，相对于本步已有的位移是否可忽略"。
-    //
-    //     为什么用位移量级而不是坐标量级（本项目修过的缺陷）：
-    //     原先写作 diff / max|x̂|∞（坐标量级），放行的单步位移
-    //     = relTolerance × 坐标量级，**与刚度无关**。高刚度下真实位移
-    //     （量级 ρgℓ²/κ）远小于该门槛，于是第 1 次迭代就判"收敛"退出：
-    //       · 每次子步留下残差，在后续帧累加 -> 布料缓慢漂移；
-    //       · 判据不再平移不变 —— 同一场景平移到远处，坐标量级变大，
-    //         判据突然变松，收敛质量随摆放位置改变。
-    //     二者都是判据自身的问题，与 PD 算法无关。
-    //
-    //     下限 h²|g| 的作用：完全静止时 x̂ == xⁿ，scale 会退化为 0；
-    //     而即使静止，一个子步内重力也必然要引入 ~h²g 量级的位移，
-    //     用它做下限可避免"除以接近 0 的参照"而永不收敛。
-    {
-      usedIterations = k + 1;
-      Scalar diff = 0.0;
-      Scalar scale = 0.0;
-      for (int v = 0; v < n; ++v) {
+      const Vec3 gh2 = cfg.gravity * (h * h);
+      // 不带 nowait：紧接着的 single（惯性右端）需要预测已全部完成。
+#ifdef _OPENMP
+#pragma omp for
+#endif
+      for (long long v = 0; v < n; ++v) {
         const std::size_t i = static_cast<std::size_t>(v);
-        diff = std::max(diff, maxAbsComponent(m.positions[i] - previous[i]));
-        scale = std::max(scale, maxAbsComponent(ctx.predicted[i] - ctx.positionsBeforeStep[i]));
+        ctx.positionsBeforePrevStep[i] = ctx.positionsBeforeStep[i];
+        const Vec3 p = m.positions[i];
+        ctx.positionsBeforeStep[i] = p;
+        ctx.predicted[i] = p + m.velocities[i] * h + gh2;
+        previous[i] = p;  // 收敛判据的参照：本子步开始时的位置
       }
-      scale = std::max(scale, length(cfg.gravity) * h * h);
-      previous = m.positions;
-      const Scalar rel = (scale > 0.0) ? diff / scale : diff;
+      if (threadId() == 0) ctx.times.predict += secondsSince(t0);
+    }
 
-      // 注意 absTolerance 用 "> 0" 判定禁用：若只写成 diff <= cfg.absTolerance，
-      // 传 0 会因 diff==0 时恒成立而立刻退出（tests/chain 里记录过这个坑）。
-      const bool absHit = (cfg.absTolerance > 0.0) && (diff <= cfg.absTolerance);
-      const bool relHit = (cfg.relTolerance > 0.0) && (rel <= cfg.relTolerance);
+    // ---------------------------------------------------------------
+    // 4a) 右端的惯性部分：bBase = (M/h²) x̂（串行；只有这一项，重力不在这里）
+    //     single 的隐式 barrier 同时充当"预测趟已完成"的同步点。
+    // ---------------------------------------------------------------
+#ifdef _OPENMP
+#pragma omp single
+#endif
+    { assembleInertialRhs(m, ctx.predicted, h, cfg.velocityDamping, ctx.bBase); }
 
-      // 非线性残差判据：直接量"离本子步不动点还有多远"。
-      // 位移类判据在高刚度下会失真 —— 更新量是被 L 预条件后的梯度，
-      // 小更新不保证小物理残差（κ=1e5 时 40 次迭代只完成切向运动的 0.46%，
-      // 而单步位移看起来已经很小）。
-      // 注意：调试开关 PD_DEBUG_RESIDUAL 要求**即使判据关闭也要计算残差**，
-      // 否则"关掉判据"的对照运行里就看不到残差读数了。
-      Scalar residual = -1.0;
-      bool resHit = false;
-      const bool wantResidual = (cfg.residualTolerance > 0.0) || debugResidual();
-      if (wantResidual) {
-        residual = nonlinearResidual(ctx);
-        if (cfg.residualTolerance > 0.0) {
-          const Scalar gScale = std::max<Scalar>(length(cfg.gravity), 1.0e-12);
-          resHit = (residual <= cfg.residualTolerance * gScale);
+    // ---------------------------------------------------------------
+    // 4) PD 迭代：局部步 → 散射 → 覆盖 pin → 全局步 → 判据（循环留在区域内）
+    // ---------------------------------------------------------------
+    for (int k = 0; k < cfg.maxIterations; ++k) {
+      // 4b) 局部步：逐约束独立闭式投影（逐边写 targets[c]，无跨线程依赖）
+      {
+        const auto t0 = Clock::now();
+        DistanceTerm::projectInRegion(m, ctx.targets);
+        if (threadId() == 0) ctx.times.localStep += secondsSince(t0);
+      }
+
+      // 4c) 右端 = 基值 + 约束散射（融合：省掉整次 `b = bBase` 的 O(3N) 拷贝）
+      {
+        const auto t0 = Clock::now();
+        DistanceTerm::scatterIntoInRegion(m, ctx.targets, ctx.bBase.data(), ctx.b.data(), dim);
+        if (threadId() == 0) ctx.times.scatter += secondsSince(t0);
+      }
+
+      // 4d) 覆盖 pinned 行 + 4e) 全局步（都是一次回代；合在一个 single 里省一次 barrier）
+      {
+        const auto t0 = Clock::now();
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          applyPinRhs(m, ctx.b);
+          ctx.solver->solve(ctx.b, ctx.xSolution);
+          ctx.times.solve += secondsSince(t0);
         }
       }
-      ctx.lastResidual = residual;
 
-      PD_TRACE("迭代 %d: |Δx|∞=%.6g 相对=%.6g 残差=%.6g m/s^2", usedIterations, diff, rel, residual);
-
-      // ---- 收敛判定 ----
+      // 4f) 解包 + 收敛扫描 + previous 更新（逐顶点融合成一趟）
       //
-      // **启用残差判据时，残差达标是收敛的必要条件**，位移判据不得单独放行。
-      // 理由：位移判据只能说"这一步没怎么动"，而"没怎么动"既可能是收敛，
-      // 也可能是停滞（高刚度下更新量是被 L 预条件后的梯度，小更新不保证小残差）。
-      // 若让 `absHit || relHit` 独立触发退出，就会出现"残差 4.85 m/s² 而门槛
-      // 要求 9.8e-3 却判收敛"的情形 —— 这个组合曾被实测复现。
-      // 因此：residualTolerance > 0 时只认 resHit；为 0（未启用）时才退回位移判据。
-      bool converged = false;
-      if (cfg.residualTolerance > 0.0) {
-        converged = resHit;
-      } else {
-        converged = absHit || relHit;
+      //     部分值用**区域内声明的变量**（每线程私有），再写进共享槽位后统一合并 ——
+      //     max 是精确运算，合并顺序不影响结果，因此与串行扫描逐位相同。
+      //
+      //     scale 的定义：取"本子步已发生的位移量级"，
+      //     而不是坐标量级 —— 后者会让判据失去平移不变性、并在高刚度下过早放行。
+      Scalar localDiff = 0.0;
+      Scalar localScale = 0.0;
+      const auto tScan = Clock::now();
+#ifdef _OPENMP
+#pragma omp for nowait
+#endif
+      for (long long v = 0; v < n; ++v) {
+        const std::size_t i = static_cast<std::size_t>(v);
+        const Vec3 xNew{ctx.xSolution[3 * i + 0], ctx.xSolution[3 * i + 1], ctx.xSolution[3 * i + 2]};
+        m.positions[i] = xNew;
+        localDiff = std::max(localDiff, maxAbsComponent(xNew - previous[i]));
+        localScale = std::max(localScale, maxAbsComponent(ctx.predicted[i] - ctx.positionsBeforeStep[i]));
+        previous[i] = xNew;
       }
-      if (converged) {
-        ctx.converged = true;
-        ctx.earlyExitCount += 1;
-        break;
+#ifdef _OPENMP
+      if (threadId() < mergeSlots) {
+        partialDiff[static_cast<std::size_t>(threadId())] = localDiff;
+        partialScale[static_cast<std::size_t>(threadId())] = localScale;
       }
-    }
-  }
-  ctx.iterationsUsed = usedIterations;
+      // 显式 barrier：上面的槽位必须全部写完，下面才算得对。
+#pragma omp barrier
+#pragma omp single
+#endif
+      {
+        Scalar diff = 0.0;
+        Scalar scale = 0.0;
+        for (int t = 0; t < mergeSlots; ++t) {
+          diff = std::max(diff, partialDiff[static_cast<std::size_t>(t)]);
+          scale = std::max(scale, partialScale[static_cast<std::size_t>(t)]);
+        }
+        scale = std::max(scale, length(cfg.gravity) * h * h);
+        const Scalar rel = (scale > 0.0) ? diff / scale : diff;
 
-  // ---------------------------------------------------------------
-  // 5) 速度更新与阻尼
-  //
-  //    v_{n+1} = (1 - k_d) · (x_{n+1} - x_n) / h
-  //
-  //    这就是**全部**的速度更新：位置差除以 h，再乘一个几何衰减因子 (1-k_d)。
-  //    被 pin 的顶点速度清零，并把位置数值上再钉一次，保证严格等于 pinPositions
-  //    （避免在后续帧累积无意义的动量）。
-  //
-  //    为什么这里不需要"惯性残差补偿"之类的额外项：
-  //    预测步 x̂ = x_n + h·v_n + h²·g 已经把上一步速度带进来了，因此
-  //    v_n 的信息只应通过 x̂ 进入本步；再往速度更新里加一项就会把 v_n 计两遍
-  //    （曾经按"补偿惯性残差"的思路试过，是错的，已撤掉）。
-  //
-  //    静止时的固定点：静止意味着 x_{n+1} = x_n = y 且 v = 0，于是 x̂ = y - h²g，
-  //    不动点方程 m(y-x̂)/h² + κ(y-ℓ) = 0 退化为纯力平衡
-  //        κ(y - ℓ) = m·g   ⇒   y = ℓ - m·g/κ
-  //    （重力向量朝 -y，故质量挂在静止长度**下方**，这是能量的极小值）。
-  //    注意该结果与 k_d 和 h 都无关 —— 它们是离散格式参数，不影响静力平衡。
-  //    验收见 `pd_check` 第 3 项与 `tests/chain/spring_vertical.cpp` 第 3 项。
-  // ---------------------------------------------------------------
-  {
-    const auto t0 = Clock::now();
-    const Scalar damp = 1.0 - cfg.velocityDamping;
-    for (int v = 0; v < n; ++v) {
-      const std::size_t i = static_cast<std::size_t>(v);
-      Vec3 vNew = (m.positions[i] - ctx.positionsBeforeStep[i]) * (damp * invH);
-      if (m.isPinned(v)) {
-        vNew = Vec3{};
-        m.positions[i] = m.pinPositions[i];  // 数值上再钉一次，保证严格相等
+        // 注意 absTolerance 用 "> 0" 判定禁用：若只写成 diff <= cfg.absTolerance，
+        // 传 0 会因 diff==0 时恒成立而立刻退出（tests/chain 里记录过这个坑）。
+        const bool absHit = (cfg.absTolerance > 0.0) && (diff <= cfg.absTolerance);
+        const bool relHit = (cfg.relTolerance > 0.0) && (rel <= cfg.relTolerance);
+
+        // 非线性残差判据：直接量"离本子步不动点还有多远"。
+        // 位移类判据在高刚度下会失真 —— 更新量是被 L 预条件后的梯度，
+        // 小更新不保证小物理残差（κ=1e5 时 40 次迭代只完成切向运动的 0.46%，
+        // 而单步位移看起来已经很小）。
+        // 注意：调试开关 PD_DEBUG_RESIDUAL 要求**即使判据关闭也要计算残差**，
+        // 否则"关掉判据"的对照运行里就看不到残差读数了。
+        // 残差是串行算法（内部用静态缓冲），因此只能在 single 里跑。
+        Scalar residual = -1.0;
+        bool resHit = false;
+        const bool wantResidual = (cfg.residualTolerance > 0.0) || debugResidual();
+        if (wantResidual) {
+          residual = nonlinearResidual(ctx);
+          if (cfg.residualTolerance > 0.0) {
+            const Scalar gScale = std::max<Scalar>(length(cfg.gravity), 1.0e-12);
+            resHit = (residual <= cfg.residualTolerance * gScale);
+          }
+        }
+        ctx.lastResidual = residual;
+        // 这一趟的时间含 barrier 等待（所有线程都要到齐才算完），因此是"该阶段的墙钟"。
+        ctx.times.unpackScan += secondsSince(tScan);
+
+        // ---- 收敛判定 ----
+        //
+        // **启用残差判据时，残差达标是收敛的必要条件**，位移判据不得单独放行。
+        // 理由：位移判据只能说"这一步没怎么动"，而"没怎么动"既可能是收敛，
+        // 也可能是停滞（高刚度下更新量是被 L 预条件后的梯度，小更新不保证小残差）。
+        // 若让 `absHit || relHit` 独立触发退出，就会出现"残差 4.85 m/s² 而门槛
+        // 要求 9.8e-3 却判收敛"的情形 —— 这个组合曾被实测复现。
+        // 因此：residualTolerance > 0 时只认 resHit；为 0（未启用）时才退回位移判据。
+        const bool converged = (cfg.residualTolerance > 0.0) ? resHit : (absHit || relHit);
+        ctx.converged = converged;
+        if (converged) ctx.earlyExitCount += 1;  // 累加只能发生在一个线程上
+        ctx.iterationsUsed = k + 1;
+
+        PD_TRACE("迭代 %d: |Δx|∞=%.6g 相对=%.6g 残差=%.6g m/s^2", k + 1, diff, rel, residual);
       }
-      m.velocities[i] = vNew;
+      // single 的隐式 barrier 在所有线程上保证了同一个 `ctx.converged`，
+      // 因此这里的 break 是**一致**的（OpenMP 要求各线程以相同方式退出循环）。
+      if (ctx.converged) break;
     }
-    ctx.times.velocity += secondsSince(t0);
-  }
+
+    // ---------------------------------------------------------------
+    // 5) 速度更新与阻尼
+    //
+    //    v_{n+1} = (1 - k_d) · (x_{n+1} - x_n) / h
+    //
+    //    这就是**全部**的速度更新：位置差除以 h，再乘一个几何衰减因子 (1-k_d)。
+    //    被 pin 的顶点速度清零，并把位置数值上再钉一次，保证严格等于 pinPositions
+    //    （避免在后续帧累积无意义的动量）。
+    //
+    //    为什么这里不需要"惯性残差补偿"之类的额外项：
+    //    预测步 x̂ = x_n + h·v_n + h²·g 已经把上一步速度带进来了，因此
+    //    v_n 的信息只应通过 x̂ 进入本步；再往速度更新里加一项就会把 v_n 计两遍
+    //    （曾经按"补偿惯性残差"的思路试过，是错的，已撤掉）。
+    //
+    //    静止时的固定点：静止意味着 x_{n+1} = x_n = y 且 v = 0，于是 x̂ = y - h²g，
+    //    不动点方程 m(y-x̂)/h² + κ(y-ℓ) = 0 退化为纯力平衡
+    //        κ(y - ℓ) = m·g   ⇒   y = ℓ - m·g/κ
+    //    （重力向量朝 -y，故质量挂在静止长度**下方**，这是能量的极小值）。
+    //    注意该结果与 k_d 和 h 都无关 —— 它们是离散格式参数，不影响静力平衡。
+    //    验收见 `pd_check` 第 3 项与 `tests/chain/spring_vertical.cpp` 第 3 项。
+    // ---------------------------------------------------------------
+    {
+      const auto t0 = Clock::now();
+      const Scalar damp = 1.0 - cfg.velocityDamping;
+      // nowait：这是区域里最后一趟循环，区域结束时的隐式 barrier 已足够。
+#ifdef _OPENMP
+#pragma omp for nowait
+#endif
+      for (long long v = 0; v < n; ++v) {
+        const std::size_t i = static_cast<std::size_t>(v);
+        Vec3 vNew = (m.positions[i] - ctx.positionsBeforeStep[i]) * (damp * invH);
+        if (m.isPinned(static_cast<int>(v))) {
+          vNew = Vec3{};
+          m.positions[i] = m.pinPositions[i];  // 数值上再钉一次，保证严格相等
+        }
+        m.velocities[i] = vNew;
+      }
+      if (threadId() == 0) ctx.times.velocity += secondsSince(t0);
+    }
+  }  // 并行区域结束（隐式 barrier：所有线程都已写完）
 
   ctx.lastStepSeconds = secondsSince(tStep0);
   ctx.times.total += ctx.lastStepSeconds;
-  return usedIterations;
+  return ctx.iterationsUsed;
 }
 
 void stepFrame(SimContext& ctx) {

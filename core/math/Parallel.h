@@ -24,6 +24,17 @@ namespace pd {
 int numThreads();
 void setNumThreads(int n);
 
+/// 当前线程在**并行区域内**的编号。
+/// 不在区域内（或未启用 OpenMP）时返回 0 —— 这样"区域内代码"在串行构建下
+/// 也能原样跑通，不需要 `#ifdef` 分支（"一个子步一个区域"方案的基础）。
+int threadId();
+
+/// 当前**并行区域内**的实际线程数。
+/// 与 numThreads() 的区别：后者是"请求值"，本函数是"区域内真值"
+/// （`if` 子句把区域串行化时它是 1）。线程私有缓冲必须按这个值分配，
+/// 否则串行化的区域会白白多清零/多归约 (P-1)×dim 个槽位。
+int regionThreadCount();
+
 /// 按块划分的并行 for。fn(begin, end) 处理半开区间 [begin, end)。
 /// 调度方式为动态（schedule(dynamic)），因为局部步各元素耗时不完全一致。
 template <typename Fn>
@@ -62,6 +73,16 @@ class ThreadLocalBuffers {
     if (buffers_.empty() || buffers_.size() != static_cast<std::size_t>(std::max(1, numThreads())) ||
         buffers_[0].size() != size) {
       reset(size);
+    } else {
+      for (auto& b : buffers_) std::fill(b.begin(), b.end(), T{});
+    }
+  }
+
+  /// 按**区域内实际线程数**准备：见 regionThreadCount() 的说明。
+  void ensureFor(int nThreads, std::size_t size) {
+    const std::size_t n = static_cast<std::size_t>(std::max(1, nThreads));
+    if (buffers_.size() != n || buffers_.empty() || buffers_[0].size() != size) {
+      buffers_.assign(n, std::vector<T>(size, T{}));
     } else {
       for (auto& b : buffers_) std::fill(b.begin(), b.end(), T{});
     }

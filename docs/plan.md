@@ -452,7 +452,9 @@ $$\text{stop when } \|x^{(k+1)}-x^{(k)}\|_\infty \le \tau_{\text{abs}} \ \ \text
 
 **验收**（每项标注当前状态；✅=已有可重跑断言，❌=尚未实现）
 
-1. ✅ **原语不变量（必须先通过）** —— `tests/primitives/test_distance_term.cpp`，12 个测试 / 68 断言
+1. ✅ **原语不变量（必须先通过）** —— `tests/primitives/test_distance_term.cpp`，14 个测试 / 89 断言
+   （2026-09-21 补了两个：并行散射分支与串行分支/独立参考的对照、以及跨线程数一致断言 ——
+   该分支此前因"边数 < 256 走串行回退"而无任何覆盖）
    - 投影长度：任意位形下 $\bigl\|\,\|d_c\|-l_c\,\bigr\| < 10^{-12}$，覆盖退化（近零长度）、拉伸 10×、压缩 0.1×；
    - 投影方向：$d_c$ 与 $(x_i-x_j)$ 共线且同向；
    - 静止位形：$\|d_c-(x_i-x_j)\| = 0$（不是"小"）；
@@ -613,7 +615,7 @@ pd_ipc/
   tools/                 vk_probe.cpp（环境能力探查，已存在）
   docs/                  plan.md  environment.md  design-discussion.md  contributing.md
                          code-map.md  pd-convergence.md
-                         perf.md（**尚未创建**，M2 产物；在其存在前性能数字记于 README §3.5）
+                         perf.md（已于 2026-09-21 创建：Phase 0/1 的并行改造前后对照）
 ```
 
 **依赖策略（按本机实况）**：本地 **Eigen 3.4.0** + OpenMP（必需）；**doctest 单头**（测试，自行获取）；**GLFW 3.3.8 本地版** + 自绘 HUD（M3，ImGui 需自行获取）；**Vulkan SDK 1.3.290 + glslc**（M5 起，VMA 需自行获取或先不用）。**不引入 vcpkg、不使用 MinGW g++**。核心库 `pd_ipc_core` **不依赖窗口与 Vulkan**，保证 `bench` 与 CI 永远可跑。

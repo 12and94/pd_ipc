@@ -23,4 +23,20 @@ void setNumThreads(int n) {
 #endif
 }
 
+int threadId() {
+#ifdef _OPENMP
+  return omp_in_parallel() ? omp_get_thread_num() : 0;
+#else
+  return 0;
+#endif
+}
+
+int regionThreadCount() {
+#ifdef _OPENMP
+  return omp_in_parallel() ? omp_get_num_threads() : 1;
+#else
+  return 1;
+#endif
+}
+
 }  // namespace pd
