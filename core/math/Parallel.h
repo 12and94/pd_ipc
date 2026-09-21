@@ -56,7 +56,12 @@ void parallelFor(std::size_t count, Fn&& fn) {
 }
 
 /// 线程私有累加缓冲的辅助类：每个线程拿到一块独立缓冲，最后按固定顺序合并。
-/// 用途：并行散射（scatter）到全局右端向量，避免原子竞争。
+///
+/// **现状（2026-09-21 Phase 2 之后）：散射已不再使用它** —— 散射改为按约束着色分组执行，
+/// 同色内无冲突、不需要归约（见 `core/mesh/ConstraintColoring.h`）。这里保留它作为
+/// "需要把散开的写入归约成一个数组"这类场景的通用原语（例如将来若引入不便着色的项）。
+/// 历史：首期散射用"每线程一份全维缓冲 + 全量归约"，代价是 O(P·dim) 的内存流量
+/// —— 实测 40×40 每次 1.38 MB、是有效工作的 ~9 倍（见 `docs/perf.md` §1）。
 template <typename T>
 class ThreadLocalBuffers {
  public:

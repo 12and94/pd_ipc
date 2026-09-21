@@ -65,7 +65,8 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
-| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、稀疏结构 `buildSparsityPattern()`、规则网格生成、OBJ 载入 | 6、7 |
+| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、稀疏结构 `buildSparsityPattern()`、**约束着色**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
+| `core/mesh/ConstraintColoring.h/.cpp` | 约束（边）的图着色：同色边两两不共享顶点 —— 散射据此按颜色分组执行，**无需归约/原子加**。并行 Jones–Plassmann（优先级哈希 + 最小可用颜色），颜色数 ≤ Δ+1，同色内按顶点序排列（避免假共享）。**拓扑级数据**，随 `buildSparsityPattern()` 构建 | 散射的正确性与性能 |
 | `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + 阶段耗时）、`StageTimes` | — |
 | `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()` | 6、7 |
 
@@ -80,7 +81,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
 | `core/energy/DistanceTerm.h` | 接口：`project` / `projectOne` / `scatterInto` / `assembleMatrix`，以及**区域内版本** `projectInRegion` / `scatterIntoInRegion`（"一个子步一个区域"方案用，契约是"必须在已有并行区域内调用"，见 `docs/parallel-refactor.md` §4.1） | 1、2、3 |
-| `core/energy/DistanceTerm.cpp` | **三处与方向有关的约定都在这个文件里**（`projectEdge` / `scatterEdge` / `assembleMatrix` 三个内核函数，串行与并行两条路径共用同一份语义，不再各写一遍）：<br>① `projectEdge()`：`raw = x_a - x_b`，`d_c = ℓ·raw/‖raw‖`——方向只由端点顺序决定，**没有任何 pin 分支**（早期那个"强制指向自由端"的翻转已删除，见 `README.md` §4.1）<br>② `scatterEdge()`：`contribution = targets[c] * e.stiffness`，`out_a += contribution`、`out_b -= contribution`；某一端被 pin 时改为给自由端 `out_free += κ·q`（pin 消元补偿，见 `README.md` §4.2）<br>③ `assembleMatrix()`：对角 `+κ`、耦合 `-κ`，只跳过**两端都 pin** 的约束<br>求和规则只有一条：每线程按边序累加自己那份全维缓冲 → 按线程号升序归约（决策 D7，不用浮点原子加） | 1、2、3 |
+| `core/energy/DistanceTerm.cpp` | **三处与方向有关的约定都在这个文件里**（`projectEdge` / `scatterEdge` / `assembleMatrix` 三个内核函数，串行与并行两条路径共用同一份语义，不再各写一遍）：<br>① `projectEdge()`：`raw = x_a - x_b`，`d_c = ℓ·raw/‖raw‖`——方向只由端点顺序决定，**没有任何 pin 分支**（早期那个"强制指向自由端"的翻转已删除，见 `README.md` §4.1）<br>② `scatterEdge()`：`contribution = targets[c] * e.stiffness`，`out_a += contribution`、`out_b -= contribution`；某一端被 pin 时改为给自由端 `out_free += κ·q`（pin 消元补偿，见 `README.md` §4.2）<br>③ `assembleMatrix()`：对角 `+κ`、耦合 `-κ`，只跳过**两端都 pin** 的约束<br>求和规则只有一条：**按约束着色逐色累加**（同色边互不相邻 ⇒ 同一个顶点在每一色里最多被写一次 ⇒ 只读改写、无竞争、无归约），顺序与线程数无关，见 `core/mesh/ConstraintColoring.h` | 1、2、3 |
 
 > **排查建议**：这三处的符号必须成对，看代码时请放在一起看，单看任何一处都"像是对的"。
 > 另外散射里还有一段 **pin 消元补偿**（b_free += κ·q），它是独立的一项，容易漏 —— 见 §4 的说明。
@@ -156,7 +157,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 #   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 89 断言（14 个测试；含并行散射分支的对照）
+.\build\Release\test_primitives.exe         # 125 断言（16 个测试；含并行散射分支与约束着色的对照）
 .\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
 .\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
 
@@ -239,7 +240,7 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 | `pd_trans` | 平移一致性：pin 在任意位置下静止位移严格为 0；平移系统后相对形状不变 | 全过 |
 | `pd_chain` | 长链条对照解析解：自由链长度精确不变；悬挂链伸长与 $mg\,N(N-1)/(2\kappa)$ 吻合 | 全过 |
 | `pd_diraudit` | 方向三项：全局一致 / 物理合理 / 与标准 PD 逐位一致 | 全过 |
-| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | 89 + 155 + 15 断言 | 全绿 |
+| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | 125 + 155 + 15 断言 | 全绿 |
 
 **实测性能**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束）
 查看器 `--frames 400` 实测 60 FPS（vsync 封顶）、稳态物理 1.9 ms/帧、迭代 1 次、

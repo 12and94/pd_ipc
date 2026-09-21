@@ -39,6 +39,36 @@ void checkPinContract(const Mesh& mesh) {
   std::abort();
 }
 
+/// 前置条件检查（快速失败）：约束着色必须已经建好。
+/// 漏了它会让"按颜色分组"扫到空区间，结果是右端悄悄变成只有基值 —— 一个不会崩溃、
+/// 但物理完全错的静默错误，所以这里直接查出来并停下（与 pinPositions 契约同样的风格）。
+/// 正常路径：`Mesh::buildSparsityPattern()` 会建好；手搭 Mesh 的调用方由
+/// `Mesh::ensureConstraintColoring()` 兜底（两条散射入口都在进区域之前调用它）。
+void checkColoringContract(const Mesh& mesh) {
+  const ConstraintColoring& coloring = mesh.constraintColoring();
+  if (!coloring.built) {
+    std::fprintf(stderr,
+                 "[DistanceTerm::scatter] 违反前置条件：约束着色尚未构建（网格 %d 条约束）。\n"
+                 "  请调用 Mesh::buildSparsityPattern() 或 Mesh::ensureConstraintColoring()，\n"
+                 "  并且必须在进入并行区域**之前**调用。\n",
+                 mesh.edgeCount());
+    std::fflush(stderr);
+    std::abort();
+  }
+  // 便宜的陈旧检查（O(1)）：着色与当前边表规模必须一致。
+  // 这条能挡住"改了拓扑却没重建"的最常见形式（makeScene 建好的着色被后续替换边表复用），
+  // 把它变成一句明确的报错，而不是 scatterEdge 里的越界读（实测会以 0xC0000005 崩掉）。
+  if (static_cast<int>(coloring.colorOf.size()) != mesh.edgeCount()) {
+    std::fprintf(stderr,
+                 "[DistanceTerm::scatter] 违反前置条件：约束着色已过期 —— 着色对应 %zu 条约束，"
+                 "当前网格有 %d 条。\n  改了拓扑（增删边）之后必须重新调用 "
+                 "Mesh::buildSparsityPattern()。\n",
+                 coloring.colorOf.size(), mesh.edgeCount());
+    std::fflush(stderr);
+    std::abort();
+  }
+}
+
 /// 投影的核心（一条边）：Π_c(A_c x) = ℓ·unit(x_a − x_b)。
 ///
 /// ---- 约束方向（全项目唯一约定）----
@@ -109,16 +139,6 @@ inline void scatterEdge(const Mesh& mesh, const std::vector<Vec3>& targets, std:
   }
 }
 
-/// 每线程一份全维缓冲：散射的加法是"同一顶点被多条边累加"，并行会竞争，
-/// 而决策 D7 明确不用浮点原子加（要保证结果与线程数无关、且能映射到 GPU），
-/// 于是用"线程私有缓冲 + 固定顺序归约"。
-/// 注意它的代价是 O(P·dim)：清零与归约都按"线程数 × 自由度数"走，
-/// 与边数无关 —— 这正是 docs/parallel-refactor.md Phase 2（图着色）要消除的东西。
-ThreadLocalBuffers<Scalar>& scatterBuffers() {
-  static ThreadLocalBuffers<Scalar> buffers;
-  return buffers;
-}
-
 }  // namespace
 
 Vec3 DistanceTerm::projectOne(const Vec3& pa, const Vec3& pb, Scalar restLength) {
@@ -165,78 +185,67 @@ void DistanceTerm::scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>
   // 语义：b = base + Σ_c κ_c (A_cᵀ d_c)。base == b 表示"累加到现有值"
   // （独立入口 scatterInto 复用这条实现时用），此时要求 b 已是基值。
   const bool accumulateOnly = (base == b);
-  const int nt = regionThreadCount();
 
-  if (nt <= 1) {
-    // 单线程路径：基值先写、再按**边序号顺序**逐条累加 —— 与独立入口的串行分支逐位相同。
-    // 保留这条路径有两个理由：
-    //   ① 小网格上开区域本来就亏（见 kMinParallelEdges）；
-    //   ② 它是"1 线程下新旧实现位级一致"的对照基准（Phase 1 的验收之一）。
+  // 前置检查各查一次即可（违反时 abort，不属于热路径；读-only，无竞争）。
+  if (threadId() == 0) {
     checkPinContract(mesh);
-    if (!accumulateOnly) {
-      for (std::size_t i = 0; i < dim; ++i) b[i] = base[i];
-    }
-    const int ne = mesh.edgeCount();
-    for (long long c = 0; c < static_cast<long long>(ne); ++c) {
-      scatterEdge(mesh, targets, static_cast<std::size_t>(c), b);
-    }
-    return;
+    checkColoringContract(mesh);
   }
 
-  // 多线程：清零 → 各线程累加自己那份 → 按线程号升序归约。
-  // 求和规则与改造前完全一致（每线程按边序累加自己的分块；归约按线程号升序），
-  // 只是把"拷基值"融进了归约那一趟，省掉整次 O(3N) 的 b = bBase 拷贝。
-  ThreadLocalBuffers<Scalar>& buffers = scatterBuffers();
-#ifdef _OPENMP
-#pragma omp single
-#endif
-  {
-    checkPinContract(mesh);
-    buffers.ensureFor(nt, dim);
-  }
+  const ConstraintColoring& coloring = mesh.constraintColoring();
 
-  const int ne = mesh.edgeCount();
-  const std::size_t chunk = 64;
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic, 64)
-#endif
-  for (long long begin = 0; begin < static_cast<long long>(ne); begin += static_cast<long long>(chunk)) {
-    const long long end =
-        std::min<long long>(begin + static_cast<long long>(chunk), static_cast<long long>(ne));
-    Scalar* local = buffers[threadId()].data();
-    for (long long c = begin; c < end; ++c) scatterEdge(mesh, targets, static_cast<std::size_t>(c), local);
-  }
-
-  // 归约趟：每个输出元素独立，且对同一元素仍按 t = 0..P-1 的顺序相加 ⇒ 与改造前逐位相同。
-  // 归约本身也并行（改造前是单线程跑的 P×dim 循环）。
+  if (!accumulateOnly) {
+    // 种子趟：b = base。取代了旧方案的"每线程一份全维缓冲清零 + 归约"（O(P·dim)），
+    // 这一趟只有 O(dim) —— 这就是 Phase 2 省下来的主要流量。
 #ifdef _OPENMP
 #pragma omp for
 #endif
-  for (long long i = 0; i < static_cast<long long>(dim); ++i) {
-    Scalar partial = 0.0;
-    for (int t = 0; t < nt; ++t) partial += buffers[t][static_cast<std::size_t>(i)];
-    b[i] = accumulateOnly ? (b[i] + partial) : (base[i] + partial);
+    for (long long i = 0; i < static_cast<long long>(dim); ++i) b[i] = base[i];
+  }
+
+  // 逐色累加：同色边两两不共享顶点 ⇒ 并发写 b **没有任何冲突**，不需要私有缓冲、
+  // 不需要原子加、也不需要归约。
+  //
+  // 求和顺序 = 颜色序 0,1,…,C-1，而同一顶点在每一色里**最多被写一次**
+  // ⇒ 结果与线程数、分块、调度完全无关（位级可复现，见 tests/primitives 的跨线程断言）。
+  // 这与旧方案（每线程按分块累加、再按线程号归约）不同：那时"哪些边先相加"取决于
+  // schedule(dynamic) 的分块分配，位级结果随运行漂移。
+  //
+  // 代价：每个颜色轮是一次 `omp for`，因此每次散射有 C 个 barrier。
+  // 换来的是 O(P·dim) → O(dim + E) 的流量，实测在大网格上划算（docs/perf.md）。
+  //
+  // 调度用默认的 static（连续分块）而不是 dynamic：同色内已按顶点序排列
+  // （见 buildConstraintColoring），连续分块能让每个线程只写**自己那一段顶点**，
+  // 把 cache line 争抢降到区段边界；而且 static 的分块分配是确定的，与运行无关。
+  for (int c = 0; c < coloring.colorCount; ++c) {
+    const long long begin = static_cast<long long>(coloring.begin(c));
+    const long long end = static_cast<long long>(coloring.end(c));
+    if (begin == end) continue;  // 空色类：不浪费一次 barrier（所有线程看到同样的值）
+#ifdef _OPENMP
+#pragma omp for
+#endif
+    for (long long k = begin; k < end; ++k) {
+      scatterEdge(mesh, targets, coloring.order[static_cast<std::size_t>(k)], b);
+    }
   }
 }
 
 void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& targets, Scalar* b,
                                std::size_t dim) {
   const int ne = mesh.edgeCount();
-  if (numThreads() <= 1 || ne < kMinParallelEdges) {
-    // 串行分支：直接按边序累加进 b（不经过线程私有缓冲）。
-    checkPinContract(mesh);
-    for (long long c = 0; c < static_cast<long long>(ne); ++c) {
-      scatterEdge(mesh, targets, static_cast<std::size_t>(c), b);
-    }
-    return;
-  }
+  // 懒构建兜底：**必须在进区域之前**（见 Mesh::ensureConstraintColoring 的说明）。
+  mesh.ensureConstraintColoring();
+  // 与 stepOnce 同一套做法：小网格 / 单线程时用 `if` 子句把区域**串行化**，
+  // 而不是另写一条"直接按边序累加"的串行分支 ——
+  // 求和顺序全项目只有一条（颜色序），这样 1 线程与 18 线程的结果才能逐位相同。
+  const bool useParallel = (numThreads() > 1) && (ne >= kMinParallelEdges);
 #ifdef _OPENMP
-#pragma omp parallel num_threads(numThreads())
+#pragma omp parallel num_threads(numThreads()) if (useParallel)
+#endif
   {
-    // base == b ⇒ 累加到现有值，与改造前的 parallel 分支语义相同（含同样的归约顺序）。
+    // base == b ⇒ 累加到现有值，与改造前 parallel 分支的语义相同。
     scatterIntoInRegion(mesh, targets, b, b, dim);
   }
-#endif
 }
 
 void DistanceTerm::assembleMatrix(const Mesh& mesh, const std::vector<Vec3>&,

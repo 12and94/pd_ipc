@@ -31,6 +31,7 @@ find_package(OpenMP QUIET)
 add_library(pd_core STATIC
   core/math/Parallel.cpp
   core/mesh/Mesh.cpp
+  core/mesh/ConstraintColoring.cpp
   core/energy/DistanceTerm.cpp
   core/assemble/Assembler.cpp
   core/solver/EigenDirectSolver.cpp

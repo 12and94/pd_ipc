@@ -491,15 +491,15 @@ TEST(parallelScatterMatchesSerialReference) {
   char buf[360];
   std::snprintf(buf, sizeof(buf),
                 "20x20 网格(%d 边, 含 2 个 pin) 最大差: 串行vs参考 %.3g, 并行vs参考 %.3g, "
-                "并行vs串行 %.3g   (容差 %.3g, 量级 %.3g)",
+                "并行vs串行 %.3g   (参考容差 %.3g, 量级 %.3g)",
                 m.edgeCount(), dSerialRef, dParallelRef, dParallelSerial, tol, scale);
-  CHECK_MSG(dSerialRef <= tol, buf);
+  CHECK_MSG(dSerialRef <= tol, buf);   // 参考实现按边序号序累加；顺序不同，只承诺 ≤1e-12
   CHECK_MSG(dParallelRef <= tol, buf);
-  CHECK_MSG(dParallelSerial <= tol, buf);
+  // 并行与 1 线程现在**必须位级相同**：两者都按颜色序累加（Phase 2 之后全项目只有这一条顺序）。
+  CHECK_MSG(dParallelSerial == 0.0, "并行与 1 线程必须位级相同（同为颜色序累加）");
 
-  // 诊断（不作断言）：位级是否相同 —— 这决定"与线程数无关"到底是结构保证还是经验观察。
-  std::printf("    [注] 并行分支位级等于串行分支: %s（最大差 %.3g）\n",
-              (dParallelSerial == 0.0) ? "是" : "否", dParallelSerial);
+  std::printf("    [注] 并行 vs 1 线程位级相同: %s；vs 边序参考最大差 %.3g（顺序不同，只承诺 ≤1e-12）\n",
+              (dParallelSerial == 0.0) ? "是" : "否", dParallelRef);
 }
 
 TEST(scatterIsThreadCountIndependent) {
@@ -514,15 +514,14 @@ TEST(scatterIsThreadCountIndependent) {
   DistanceTerm::scatterInto(m, targets, base.data(), base.size());
 
   const double scale = std::max(1.0, maxAbsValue(base));
-  const double tol = 1e-12 * scale;
   double worst = 0.0;
   int runs = 0;
   int bitwiseSame = 0;
 
   for (const int threads : {2, 4, 8, 18}) {
     setNumThreads(threads);
-    // 同一线程数重复 4 次：`schedule(dynamic, 64)` 的分块分配一旦变化，
-    // 求和分组就变 —— 重复运行是暴露它的最便宜手段。
+    // 同一线程数重复 4 次：`schedule(dynamic, 64)` 的分块分配会随运行变化，
+    // 因此"重复运行也位级相同"是一条有分辨力的断言（Phase 2 之前它不成立）。
     for (int rep = 0; rep < 4; ++rep) {
       std::vector<Scalar> b(dim, 0.0);
       DistanceTerm::scatterInto(m, targets, b.data(), b.size());
@@ -530,16 +529,116 @@ TEST(scatterIsThreadCountIndependent) {
       worst = std::max(worst, d);
       ++runs;
       if (d == 0.0) ++bitwiseSame;
-      char buf[256];
-      std::snprintf(buf, sizeof(buf), "%d 线程第 %d 次: 与 1 线程结果最大差 %.3g > 容差 %.3g",
-                    threads, rep + 1, d, tol);
-      CHECK_MSG(d <= tol, buf);
+      char buf[288];
+      std::snprintf(buf, sizeof(buf),
+                    "%d 线程第 %d 次: 与 1 线程结果的最大差 %.3g —— Phase 2 之后"
+                    "累加顺序固定为颜色序，必须**位级相同**",
+                    threads, rep + 1, d);
+      CHECK_MSG(d == 0.0, buf);
     }
   }
   setNumThreads(savedThreads);
 
-  std::printf("    [注] 跨线程数/重复运行共 %d 次，最大差 %.3g（量级 %.3g）；其中位级相同 %d 次\n",
+  std::printf("    [注] 跨线程数/重复运行共 %d 次，最大差 %.3g（量级 %.3g）；位级相同 %d 次\n",
               runs, worst, scale, bitwiseSame);
+  CHECK_MSG(bitwiseSame == runs, "全部运行都必须与 1 线程结果位级相同");
+}
+
+// ---------------------------------------------------------------------------
+// 7) 约束着色（Phase 2）：同色边两两不共享顶点 —— 散射因此不需要任何归约
+//
+// 这是"按颜色分组执行散射"的全部依据：同色内并发写 b 无冲突、无需私有缓冲、
+// 无需原子加；而"同一顶点每色最多被写一次"又让求和顺序固定为颜色序 ⇒ 位级可复现。
+// ---------------------------------------------------------------------------
+TEST(constraintColoringIsProperAndComplete) {
+  for (const auto& dims : {std::pair<int, int>{2, 2}, {5, 5}, {20, 20}, {40, 40}}) {
+    Mesh m = Mesh::makeGrid(dims.first, dims.second, 0.05);
+    const ConstraintColoring& col = m.constraintColoring();
+    const int ne = m.edgeCount();
+    const std::string tag = std::to_string(dims.first) + "x" + std::to_string(dims.second);
+
+    CHECK_MSG(col.built, tag + "：着色应当已构建（buildSparsityPattern 会一并建好）");
+    CHECK_MSG(static_cast<int>(col.colorOf.size()) == ne, tag + "：colorOf 必须覆盖每条边");
+    CHECK_MSG(col.colorCount >= 1, tag + "：至少要有一色");
+
+    bool complete = true;
+    for (uint32_t c : col.colorOf) complete = complete && (c < static_cast<uint32_t>(col.colorCount));
+    CHECK_MSG(complete, tag + "：每条边都必须被着色");
+
+    // 分组（CSR）必须与 colorOf 自洽
+    bool grouped = (static_cast<int>(col.order.size()) == ne) &&
+                   (static_cast<int>(col.start.size()) == col.colorCount + 1) && col.begin(0) == 0 &&
+                   static_cast<int>(col.end(col.colorCount - 1)) == ne;
+    for (int c = 0; c < col.colorCount && grouped; ++c) {
+      for (uint32_t k = col.begin(c); k < col.end(c); ++k) {
+        grouped = grouped && (col.colorOf[col.order[k]] == static_cast<uint32_t>(c));
+      }
+    }
+    CHECK_MSG(grouped, tag + "：按颜色分组的 CSR 必须与 colorOf 自洽");
+
+    // 恰当性：同一颜色里不允许两条边共享顶点
+    std::vector<int> owner(static_cast<std::size_t>(m.vertexCount()), -1);
+    int conflicts = 0;
+    for (int c = 0; c < col.colorCount; ++c) {
+      std::fill(owner.begin(), owner.end(), -1);
+      for (uint32_t k = col.begin(c); k < col.end(c); ++k) {
+        const Edge& e = m.edges[col.order[k]];
+        const std::size_t a = static_cast<std::size_t>(e.a);
+        const std::size_t b = static_cast<std::size_t>(e.b);
+        if (owner[a] >= 0 || owner[b] >= 0) ++conflicts;
+        owner[a] = 1;
+        owner[b] = 1;
+      }
+    }
+    CHECK_MSG(conflicts == 0,
+              tag + "：同色边不允许共享顶点（实测冲突 " + std::to_string(conflicts) + " 处）");
+
+    // 下界：任何恰当边着色至少要用 Δ（最大顶点度）种颜色。
+    // 只断言**下界**：MIS 迭代法的颜色数上界我援引不出可靠证明，写下来就是假门槛
+    //（实测值用 [注] 打出来，见 docs/perf.md）。
+    std::vector<int> deg(static_cast<std::size_t>(m.vertexCount()), 0);
+    for (const Edge& e : m.edges) {
+      ++deg[static_cast<std::size_t>(e.a)];
+      ++deg[static_cast<std::size_t>(e.b)];
+    }
+    int maxDeg = 0;
+    for (int d : deg) maxDeg = std::max(maxDeg, d);
+    CHECK_MSG(col.colorCount >= maxDeg, tag + "：颜色数 " + std::to_string(col.colorCount) +
+                                            " 小于最大顶点度 " + std::to_string(maxDeg));
+    std::printf("    [注] %s：边 %d、颜色 %d（Δ=%d）\n", tag.c_str(), ne, col.colorCount, maxDeg);
+  }
+}
+
+TEST(constraintColoringIsDeterministicAndTopologyOnly) {
+  const int savedThreads = numThreads();
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);  // 760 条边 ⇒ 走并行标记路径
+  const ConstraintColoring reference = m.constraintColoring();
+
+  // (a) 线程数不影响：1 线程与 18 线程各自重算，结果必须逐位相同
+  ConstraintColoring c1;
+  setNumThreads(1);
+  buildConstraintColoring(m, c1);
+  ConstraintColoring c18;
+  setNumThreads(18);
+  buildConstraintColoring(m, c18);
+  setNumThreads(savedThreads);
+
+  CHECK_MSG(c1.colorCount == c18.colorCount, "两次着色的颜色数必须相同");
+  CHECK_MSG(c1.colorOf == c18.colorOf, "1 线程与 18 线程的 colorOf 必须逐位相同");
+  CHECK_MSG(c1.order == c18.order, "1 线程与 18 线程的颜色分组必须逐位相同");
+  CHECK_MSG(reference.colorOf == c1.colorOf && reference.order == c1.order,
+            "buildSparsityPattern 建的着色与直接调用 buildConstraintColoring 必须一致");
+
+  // (b) 位形 / 刚度 / pin 掩码都不影响着色（它是纯拓扑量，与 SolverStamp 关心
+  //     的"是不是要重分解"无关，所以改 pin 不该触发重着色）
+  for (auto& p : m.positions) p = p + Vec3{1.5, -2.5, 3.5};
+  for (auto& e : m.edges) e.stiffness *= 3.0;
+  for (std::size_t v = 0; v < m.pinned.size(); v += 7) m.pinned[v] = 1;
+  ConstraintColoring after;
+  buildConstraintColoring(m, after);
+  CHECK_MSG(after.colorOf == reference.colorOf, "位形/刚度/pin 变了，着色不应改变");
+  CHECK_MSG(after.order == reference.order, "位形/刚度/pin 变了，分组不应改变");
+  CHECK_MSG(after.colorCount == reference.colorCount, "位形/刚度/pin 变了，颜色数不应改变");
 }
 
 TEST_MAIN("primitives/distance_term")

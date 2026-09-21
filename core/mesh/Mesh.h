@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/math/Vec3.h"
+#include "core/mesh/ConstraintColoring.h"
 #include "core/solver/SparsePattern.h"
 
 namespace pd {
@@ -61,11 +62,22 @@ class Mesh {
   /// 对只给出边的模型（例如两顶点弹簧），调用方可直接设置 masses。
   void computeMassesFromEdges(Scalar density);
 
-  /// 从边表构建 3N x 3N 稀疏结构（唯一非零块列表，行主序）。
-  /// 该结构**只依赖拓扑**，因此只需构建一次即可长期复用。
+  /// 从边表构建 3N x 3N 稀疏结构（唯一非零块列表，行主序），
+  /// **并顺带建好约束着色**（见下面的说明）。
+  /// 两者都只依赖拓扑，因此生命周期相同、一起失效：**改拓扑后必须重新调用本函数**。
   void buildSparsityPattern();
 
   const std::vector<BlockEntry>& blockPattern() const { return blocks_; }
+
+  /// 约束着色（同色边互不相邻），供散射按颜色分组执行 —— 见 `ConstraintColoring.h`。
+  /// 由 `buildSparsityPattern()` 一并构建：**它也是拓扑级数据**（与位形、刚度、阻尼、
+  /// pin 掩码都无关），所以任何构造路径只要调了 `buildSparsityPattern()` 就已经有了。
+  const ConstraintColoring& constraintColoring() const { return coloring_; }
+
+  /// 确保着色已构建（幂等，O(1) 检查）。给"手搭 Mesh 但没调 buildSparsityPattern()"
+  /// 的调用方兜底（测试、`_verify/` 程序里很常见）：**必须在进入并行区域之前调用**，
+  /// 否则会在区域里一边构建一边被别的线程读。散射的两条入口都已经在处理。
+  void ensureConstraintColoring() const;
 
   // ---- 统计与校验 ----
   Scalar totalMass() const;
@@ -76,7 +88,8 @@ class Mesh {
   int countDuplicateEdges() const;
 
  private:
-  std::vector<BlockEntry> blocks_;  ///< 稀疏结构：所有非零 3x3 块的位置
+  std::vector<BlockEntry> blocks_;         ///< 稀疏结构：所有非零 3x3 块的位置
+  mutable ConstraintColoring coloring_;    ///< 约束着色（拓扑级；可懒构建，故 mutable）
 };
 
 }  // namespace pd

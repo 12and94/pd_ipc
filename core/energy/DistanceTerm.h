@@ -70,11 +70,16 @@ class DistanceTerm {
 
   /// 区域内版本：`b[i] = base[i] + Σ_c κ_c (A_c^T d_c)[i]`（含 pin 消元补偿）。
   ///
-  /// 与 scatterInto 的关系：**求和规则完全相同**（每线程私有全维缓冲 →
-  /// 按线程号升序归约），只是把"拷贝基值 + 归约"合成一趟并行循环；
-  /// 因此逐元素结果与 `b = base; scatterInto(...)` 逐位相同（加法顺序不变）。
+  /// 实现方式（Phase 2 之后）：按**约束着色**逐色执行 —— 同色边两两不共享顶点，
+  /// 因此并发写 b 无冲突，**不需要私有缓冲、不需要原子加、也不需要归约**。
+  /// 求和顺序是全项目唯一的那一条：**颜色序 0,1,…,C-1**（同一顶点每色最多被写一次），
+  /// 所以结果与线程数、分块、调度完全无关，可位级复现。
   ///
-  /// base 与 b 必须都能访问 3*vertexCount 个元素且**不重叠**（base 通常是 bBase）。
+  /// 代价：每次调用有 C 个 barrier（C = 颜色数）；换掉的是旧方案 O(P·dim) 的归约流量。
+  /// 详见 `docs/parallel-refactor.md` Phase 2 与 `docs/perf.md`。
+  ///
+  /// base 与 b 必须都能访问 3*vertexCount 个元素；`base == b` 表示"累加到现有值"
+  /// （独立入口 `scatterInto` 复用这条实现时用）。
   static void scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>& targets,
                                   const Scalar* base, Scalar* b, std::size_t dim);
 };

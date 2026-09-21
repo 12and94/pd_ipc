@@ -199,6 +199,20 @@ void Mesh::buildSparsityPattern() {
                               return p.row == q.row && p.col == q.col;
                             }),
                 blocks_.end());
+
+  // 约束着色（拓扑级，供散射按颜色分组执行；见 core/mesh/ConstraintColoring.h）。
+  // 放在这里而不是散落各处：所有构造路径（makeGrid / loadObj / 测试 / _verify）
+  // 都已经在调本函数，于是"有拓扑就有着色"，不需要额外的失效跟踪。
+  //
+  // **必须无条件重建**，不能走幂等的 ensureConstraintColoring()：
+  // 本函数同时也是"拓扑变了"的入口（例如 `_verify/chain_test.cpp` 先 makeScene 拿到网格，
+  // 再清空边表换成一条链），此时旧着色引用的边索引已经失效 —— 那正是会越界读的场景。
+  buildConstraintColoring(*this, coloring_);
+}
+
+void Mesh::ensureConstraintColoring() const {
+  // 幂等、O(1) 检查（看 built 而不是 colorCount：0 条边的网格也算"已构建"）。
+  if (!coloring_.built) buildConstraintColoring(*this, coloring_);
 }
 
 Scalar Mesh::totalMass() const {
