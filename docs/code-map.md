@@ -102,7 +102,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 |---|---|---|
 | `core/assemble/Assembler.h/.cpp` | `computeStamp()`（判定何时需要重新分解：拓扑/刚度/质量/h/pin/阻尼）、`assembleLeftHandSide()`（$M/h^2+\sum\kappa A^\top A$ + pinned 行覆盖）、`assembleInertialRhs()`（右端 $(M/h^2)\hat x$，**重力不在这里**）、`applyPinRhs()`（pinned 行右端置为把手位置）、`pack/unpackPositions` | 3、7 |
 | `core/solver/IGlobalSolver.h` | 求解器抽象：`analyze` / `factorize` / `solve` 三段 + `SolverStamp`。三条路线的差异都收在这里 | 7 |
-| `core/solver/EigenDirectSolver.h/.cpp` | `Eigen::SimplicialLDLT` 实现；符号分解用**真实矩阵结构**（不能用理想块模式，否则 solve 阶段会访问越界） | 7 |
+| `core/solver/EigenDirectSolver.h/.cpp` | `Eigen::SimplicialLDLT` 实现；符号分解用**真实矩阵结构**（不能用理想块模式，否则 solve 阶段会访问越界）。<br>**2026-09-22 起 `solve` 由本文件自己实现**（前代 scatter 形式 + 预存 1/D + 回代直接扫 CSC 列），排序也由它自己调 AMD（`Eigen::AMDOrdering`）以便拿到置换：实测比 `SimplicialLDLT::solve()` 快 10–20 %（回代占单子步 76 %），且**数值与之逐位相同**。原因与踩过的坑见 `docs/perf.md` §8 | 7 |
 | `core/solver/SparsePattern.h` | `BlockEntry`（3×3 非零块的位置） | — |
 
 ### 2.5 时间积分（**阻尼与速度更新在这里**）
