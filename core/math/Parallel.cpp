@@ -1,6 +1,20 @@
 // core/math/Parallel.cpp
 #include "core/math/Parallel.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace pd {
 
 namespace {
@@ -57,6 +71,53 @@ int regionThreadCount() {
   return omp_in_parallel() ? omp_get_num_threads() : 1;
 #else
   return 1;
+#endif
+}
+
+void pinSolveThreadsOnce(int slots) {
+#if !defined(_WIN32)
+  (void)slots;
+#else
+  // 环境变量只解析一次（函数内静态初始化，C++11 起线程安全）。
+  static const int mode = [] {
+    const char* m = std::getenv("PD_AFFINITY");
+    if (m == nullptr) return 0;
+    if (std::strcmp(m, "workers") == 0) return 1;
+    if (std::strcmp(m, "exclusive") == 0) return 2;
+    return 0;
+  }();
+  if (mode == 0) return;
+
+  // 每个线程只设置一次（SetThreadAffinityMask 是系统调用，不能放进每迭代的热路径）。
+  static thread_local bool done = false;
+  if (done) return;
+  done = true;
+
+  const int tid = threadId();  // 区域内线程号
+  DWORD_PTR want = 0;
+  const char* what = nullptr;
+  if (tid < slots) {
+    // Alder Lake 的枚举：LP2i / LP2i+1 是同一个 P-core 的一对超线程
+    // ⇒ 取偶数号 = 8 个 P-core 各自的主线程。slots 条线程各占一个独立物理核。
+    want = static_cast<DWORD_PTR>(1) << (2 * tid);
+    what = "工作线程（占独立物理核）";
+  } else if (mode == 2) {
+    want = ~static_cast<DWORD_PTR>(0x3F);  // LP6..19：把那几个物理核让出来
+    what = "其余线程（exclusive：被限制在 LP6..19）";
+  } else {
+    return;  // workers 模式：其余线程**保持完全自由调度**（一个掩码都不设）
+  }
+
+  const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), want);
+  if (prev == 0) {
+    std::fprintf(stderr, "[affinity] tid=%d 设置掩码 0x%llx 失败（GetLastError=%lu）—— 本次测量无效\n",
+                 tid, static_cast<unsigned long long>(want),
+                 static_cast<unsigned long>(GetLastError()));
+  } else {
+    std::fprintf(stderr, "[affinity] tid=%d %s：0x%llx → 0x%llx\n", tid, what,
+                 static_cast<unsigned long long>(prev), static_cast<unsigned long long>(want));
+  }
+  std::fflush(stderr);
 #endif
 }
 

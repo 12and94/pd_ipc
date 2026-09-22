@@ -330,6 +330,11 @@ int stepOnce(SimContext& ctx) {
 #pragma omp parallel num_threads(numThreads()) if (useParallel)
 #endif
   {
+    // 诊断开关（默认关闭，不改变任何行为）：PD_AFFINITY=workers|exclusive 时，把"参与全局步
+    // 的那几条线程"固定到各自独立的物理核上；workers 模式下其余线程保持**完全自由调度**。
+    // 用途仅限标定落点/绑核的影响，结论见 docs/open-issues.md §3。见 core/math/Parallel.h。
+    pinSolveThreadsOnce(ctx.solver->parallelComponents());
+
     // ---------------------------------------------------------------
     // 3) 预测：x̂ = x + h v + h² g
     //    与"保存上一步位置""初始化 previous"融合成一趟（逐顶点，都是只写自己）。
