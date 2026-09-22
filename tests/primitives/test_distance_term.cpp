@@ -784,4 +784,293 @@ TEST(shearDiagonalsAreAddedOnceAndKeepEdgeUniqueness) {
   CHECK_MSG(sheared.countDuplicateEdges() == 0, "对角边不应与已有边重复");
 }
 
+// ---------------------------------------------------------------------------
+// 9) 线性（中点）弯曲约束：构造 / 平直零力 / 三点解析 / 位形无关
+//
+// 约束形式（`core/mesh/Mesh.h` 的 BendStencil）：沿行/列取连续三个顶点 (a,b,c)，
+//   A_s x = x_a - 2 x_b + x_c，E_s = (k/2)‖A_s x‖²
+// 它没有局部步、没有散射（投影恒为 0），全部影响只在这三处：
+//   ① 网格生成（函数体自动重建稀疏结构/着色/关联表）；② 左端块 k·w_p·w_q·I₃ + 右端常向量；
+//   ③ 残差（残差是唯一放行判据，口径必须含弯曲力 —— 见 Integrator.cpp）。
+// 本节钉的是其中"能解析算出来"的部分。
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 手工搭一条三点直链（只有弯曲 stencil，没有距离约束），pin 两端。
+/// 顶点沿 +x 等距排列；中间顶点沿 y 抬高 `eps`。
+Mesh makeThreePointChain(Scalar spacing, Scalar eps, Scalar kBend) {
+  const int n = 3;
+  Mesh m;
+  m.positions.resize(static_cast<std::size_t>(n));
+  m.velocities.assign(static_cast<std::size_t>(n), Vec3{});
+  m.masses.assign(static_cast<std::size_t>(n), 1.0);
+  m.pinned.assign(static_cast<std::size_t>(n), 0);
+  m.pinPositions.resize(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    const Vec3 p{static_cast<Scalar>(i) * spacing, (i == 1) ? eps : Scalar{0}, Scalar{0}};
+    m.positions[static_cast<std::size_t>(i)] = p;
+    m.pinPositions[static_cast<std::size_t>(i)] = p;
+  }
+  m.restPositions = m.positions;
+  BendStencil s;
+  s.a = 0;
+  s.b = 1;
+  s.c = 2;
+  s.stiffness = kBend;
+  m.bends.push_back(s);
+  m.pinned[0] = 1;
+  m.pinned[2] = 1;
+  m.buildSparsityPattern();
+  return m;
+}
+
+/// 独立重算某个顶点的弯曲力（不复用 core 的实现，避免"自己验证自己"）：
+///   f_v = Σ_{stencil 含 v} -k·w_v·(x_a - 2x_b + x_c)
+Vec3 referenceBendForce(const Mesh& m, int v) {
+  Vec3 f{0, 0, 0};
+  for (const BendStencil& s : m.bends) {
+    const int vertex[3] = {s.a, s.b, s.c};
+    const Scalar weight[3] = {1.0, -2.0, 1.0};
+    for (int t = 0; t < 3; ++t) {
+      if (vertex[t] != v) continue;
+      const Vec3 second = m.positions[static_cast<std::size_t>(s.a)] -
+                          m.positions[static_cast<std::size_t>(s.b)] * 2.0 +
+                          m.positions[static_cast<std::size_t>(s.c)];
+      f += second * (-s.stiffness * weight[t]);
+    }
+  }
+  return f;
+}
+
+}  // namespace
+
+TEST(bendingStencilCountAndVertexIndicesAreExact) {
+  // ① stencil 数量与顶点索引正确。
+  //
+  // 计数是可解析的：行方向每行 (nx-2) 条 × ny 行，列方向每列 (ny-2) 条 × nx 列，
+  // 合计 (nx-2)*ny + (ny-2)*nx。**端点不生成**（中心差分需要两侧邻居），
+  // 所以边界一圈没有弯曲约束 —— 这是标准做法（自由端/自然边界条件），不是漏了。
+  const int nx = 20;
+  const int ny = 14;
+  const Scalar spacing = 0.05;
+  const Scalar k = 777.0;
+
+  Mesh base = Mesh::makeGrid(nx, ny, spacing);
+  CHECK_MSG(base.bendCount() == 0, "默认（不调用 addBendingStencils）时不应有任何弯曲 stencil");
+
+  Mesh m = Mesh::makeGrid(nx, ny, spacing);
+  const int added = m.addBendingStencils(nx, ny, k);
+  const int expected = (nx - 2) * ny + (ny - 2) * nx;
+  CHECK_MSG(added == expected, "弯曲 stencil 数应为 (nx-2)*ny + (ny-2)*nx = " +
+                                   std::to_string(expected) + "，实际 " + std::to_string(added));
+  CHECK(m.bendCount() == expected);
+
+  // 逐条核对顶点三元组：前 (nx-2)*ny 条是行方向、其余是列方向的。
+  // 索引约定 v = j*nx + i（与 makeGrid 一致）。
+  bool indicesOk = true;
+  for (int j = 0; j < ny && indicesOk; ++j) {
+    for (int i = 1; i + 1 < nx && indicesOk; ++i) {
+      const int idx = j * (nx - 2) + (i - 1);
+      const BendStencil& s = m.bends[static_cast<std::size_t>(idx)];
+      indicesOk = (s.a == j * nx + i - 1) && (s.b == j * nx + i) && (s.c == j * nx + i + 1);
+    }
+  }
+  CHECK_MSG(indicesOk, "行方向 stencil 的顶点三元组必须是同行的 (i-1, i, i+1)");
+
+  const int rowCount = (nx - 2) * ny;
+  indicesOk = true;
+  for (int i = 0; i < nx && indicesOk; ++i) {
+    for (int j = 1; j + 1 < ny && indicesOk; ++j) {
+      const int idx = rowCount + i * (ny - 2) + (j - 1);
+      const BendStencil& s = m.bends[static_cast<std::size_t>(idx)];
+      indicesOk = (s.a == (j - 1) * nx + i) && (s.b == j * nx + i) && (s.c == (j + 1) * nx + i);
+    }
+  }
+  CHECK_MSG(indicesOk, "列方向 stencil 的顶点三元组必须是同列的 (j-1, j, j+1)");
+
+  bool stiffnessOk = true;
+  for (const BendStencil& s : m.bends) {
+    if (s.stiffness != k) stiffnessOk = false;
+  }
+  CHECK_MSG(stiffnessOk, "每条 stencil 的刚度都必须等于传入值");
+
+  // 端点不含弯曲：中间顶点（b）的行列索引都必须落在 1..n-2 里。
+  bool noBoundary = true;
+  for (int r = 0; r < rowCount; ++r) {
+    const int i = m.bends[static_cast<std::size_t>(r)].b % nx;
+    if (i < 1 || i > nx - 2) noBoundary = false;
+  }
+  for (int r = rowCount; r < m.bendCount(); ++r) {
+    const int j = m.bends[static_cast<std::size_t>(r)].b / nx;
+    if (j < 1 || j > ny - 2) noBoundary = false;
+  }
+  CHECK_MSG(noBoundary, "端点（i=0/nx-1 或 j=0/ny-1）不应生成弯曲 stencil（自由端边界）");
+
+  // 函数会自动重建拓扑级数据（照抄 addShearDiagonals 的做法）：
+  // 关联表规模必须与 stencil 数一致，否则残差的 gather 会越界读。
+  const BendAdjacency& adj = m.bendAdjacency();
+  CHECK_MSG(adj.vertexStart.size() == static_cast<std::size_t>(m.vertexCount()) + 1,
+            "vertexStart 必须覆盖全部顶点（buildSparsityPattern 应被自动调用）");
+  CHECK_MSG(adj.vertexStencils.size() == static_cast<std::size_t>(m.bendCount()) * 3,
+            "vertexStencils 必须是 3×stencil 数（每个 stencil 记三份）");
+  CHECK(adj.vertexStencilWeight.size() == adj.vertexStencils.size());
+  // 每个顶点的关联项按 stencil 号升序（这是"串行残差 == gather 残差逐位相同"的依据）
+  bool sorted = true;
+  for (int v = 0; v < m.vertexCount() && sorted; ++v) {
+    for (uint32_t idx = adj.vertexStart[static_cast<std::size_t>(v)];
+         idx + 1 < adj.vertexStart[static_cast<std::size_t>(v) + 1]; ++idx) {
+      if (adj.vertexStencils[idx] >= adj.vertexStencils[idx + 1]) sorted = false;
+    }
+  }
+  CHECK_MSG(sorted, "顶点关联 stencil 的 CSR 必须按 stencil 号升序（残差两口径逐位相同的前提）");
+}
+
+TEST(bendingForceIsZeroOnFlatConfiguration) {
+  // ② 平直静止位形下弯曲力为零（A_c x = 0 ⇒ ∇E = 0）。
+  // 这是"弯曲项不会给平直布料凭空加力"的定义级判据 —— 加错符号/系数会立刻在平坦
+  // 位形上留下非零力，而那一项在视觉上几乎看不出来（布料会"自己抖"而已）。
+  //
+  // **用二进制可精确表示的坐标**（0.25 的整数倍）：这样
+  // `x_a - 2.0*x_b + x_c` 是精确的 0，可以断言"**严格**等于 0"而不是"小于某阈值"。
+  // 这条区别是必要的：`makeGrid(nx, ny, 0.05)` 的坐标是 i*0.05，浮点上并不精确
+  // （0.05 不可精确表示），二阶差分只会到 ~1e-13 量级 —— 那种装置**验不出**系数错
+  // （把 2 写成 1.9999 也能过），所以这里刻意不用它。
+  Mesh m = Mesh::makeGrid(6, 5, 0.25);
+  const int added = m.addBendingStencils(6, 5, 5.0e3);
+  CHECK(added == (6 - 2) * 5 + (5 - 2) * 6);  // 20 + 18 = 38
+
+  double worst = 0.0;
+  for (int v = 0; v < m.vertexCount(); ++v) {
+    worst = std::max(worst, static_cast<double>(length(referenceBendForce(m, v))));
+  }
+  CHECK_MSG(worst == 0.0, "平直静止位形下弯曲力必须严格为 0（A_c x = 0，坐标为二进制精确值）");
+
+  // 反证（让这条断言有分辨力）：把中间一个顶点的系数算错一点点，力就必须非零。
+  // 这里用"人为地把一个顶点抬高 1e-9"来构造非零二阶差分 —— 若上面的断言是
+  // "力恒为 0"这种恒真式，这一条会失败。
+  Mesh m2 = Mesh::makeGrid(6, 5, 0.25);
+  m2.addBendingStencils(6, 5, 5.0e3);
+  m2.positions[static_cast<std::size_t>(2 * 6 + 3)].y += 1e-9;
+  double worst2 = 0.0;
+  for (int v = 0; v < m2.vertexCount(); ++v) {
+    worst2 = std::max(worst2, static_cast<double>(length(referenceBendForce(m2, v))));
+  }
+  CHECK_MSG(worst2 > 0.0, "抬 1e-9 之后弯曲力必须非零（否则上面那条断言没有分辨力）");
+}
+
+TEST(bendingRestoringForceMatchesAnalyticExpression) {
+  // ③ 三点链的小规模解析：回复力方向与大小等于 -k·w_v·(A_c x)（逐分量），
+  //    并验证"上抬中间点 ⇒ 力朝 -y"（把点拉回直线）。
+  const Scalar spacing = 0.1;
+  const Scalar k = 2.0e3;
+  const Scalar eps = 0.01;
+  Mesh m = makeThreePointChain(spacing, eps, k);
+
+  // A_c x = x_a - 2 x_b + x_c = (0,0,0) - 2(0.1, eps, 0) + (0.2,0,0) = (0, -2eps, 0)
+  // 中间顶点 b 的权重是 -2 ⇒ 力 = -k·(-2)·(0, -2eps, 0) = (0, -4k·eps, 0)。
+  const Vec3 second{0.0, -2.0 * eps, 0.0};
+  const Vec3 wantMid = second * (-k * (-2.0));
+  // 端点 a 与 c 各拿 -k·(+1)·second = (0, +2k·eps, 0)（两侧对称，把两端朝中间拉）。
+  const Vec3 wantEnd = second * (-k * 1.0);
+
+  for (int v = 0; v < m.vertexCount(); ++v) {
+    const Vec3 f = referenceBendForce(m, v);
+    const Vec3 want = (v == 1) ? wantMid : wantEnd;
+    CHECK_NEAR(f.x, want.x, 1e-12);
+    CHECK_NEAR(f.y, want.y, 1e-12);
+    CHECK_NEAR(f.z, want.z, 1e-12);
+  }
+  CHECK_MSG(wantMid.y < 0.0, "上抬中间点后它的弯曲力必须朝 -y（回复力，不是推得更远）");
+  CHECK_NEAR(wantMid.y, -4.0 * k * eps, 1e-12);
+  CHECK_NEAR(wantEnd.y, +2.0 * k * eps, 1e-12);
+
+  // 左端矩阵：自由行 v1 的对角 = m/h² + 4k（w_b² = 4）；
+  // **pinned 行必须恰好是单位行** —— 这一条同时钉住"pinned 列必须从自由行里拿掉"：
+  // 漏了它矩阵会变成不定的（行列式变负），而求解器**不报错**、给出全错的解。
+  const Scalar h = 1.0 / 120.0;
+  Eigen::SparseMatrix<Scalar> L;
+  std::vector<Scalar> bendRhs;
+  assembleLeftHandSide(m, h, 0.0, L, &bendRhs);
+  CHECK_NEAR(L.coeff(0, 0), 1.0, 1e-15);
+  CHECK_NEAR(L.coeff(0, 3), 0.0, 0.0);
+  CHECK_NEAR(L.coeff(0, 6), 0.0, 0.0);
+  CHECK_NEAR(L.coeff(3, 0), 0.0, 0.0);  // 自由行里也不能留 pinned 列
+  CHECK_NEAR(L.coeff(3, 3), m.masses[1] / (h * h) + 4.0 * k, 1e-9);
+  CHECK_NEAR(L.coeff(4, 4), m.masses[1] / (h * h) + 4.0 * k, 1e-9);
+
+  // 右端常向量：两个端点都被 pin、w=1 ⇒ C = 1·q_a + 1·q_c = 0.2（x 分量）⇒
+  // 中间顶点的右端补偿 = -k·w_b·C = -2000·(-2)·0.2 = **+800**（x 分量）。
+  // 注意符号：对 **a 端**（w_a=+1）被 pin 的情形补偿是负的，对 **中间顶点**（w_b=-2）
+  // 就是正的 —— 所以"补偿项的方向"必须按 w_p 定，不能一律写成 -k·C。
+  CHECK_NEAR(bendRhs[3], -k * (-2.0) * 0.2, 1e-9);
+  CHECK_NEAR(bendRhs[3], 800.0, 1e-9);  // k = 2000、间距 0.1 时的具体值
+  CHECK_NEAR(bendRhs[4], 0.0, 0.0);
+  CHECK_NEAR(bendRhs[5], 0.0, 0.0);
+  // pin 行与端点行不应收到常向量
+  CHECK(bendRhs[0] == 0.0 && bendRhs[1] == 0.0 && bendRhs[2] == 0.0);
+  CHECK(bendRhs[6] == 0.0 && bendRhs[7] == 0.0 && bendRhs[8] == 0.0);
+}
+
+TEST(bendingLeftHandSideIsConfigurationIndependent) {
+  // ④ 位形无关：改位形后 L **逐位不变**。这是"只分解一次"的前提
+  //    （docs/plan.md §2.3 不变量 1），也是选"中点形式"而不是二面角形式的全部理由。
+  const int nx = 12;
+  const int ny = 12;
+  const Scalar k = 1.0e3;
+  const Scalar h = 1.0 / 120.0;
+
+  Mesh m = Mesh::makeGrid(nx, ny, 0.05);
+  m.addBendingStencils(nx, ny, k);
+  m.pinned[5 * nx + 5] = 1;
+  m.pinPositions = m.positions;
+
+  Eigen::SparseMatrix<Scalar> l1;
+  std::vector<Scalar> rhs1;
+  assembleLeftHandSide(m, h, 0.0, l1, &rhs1);
+
+  // 大幅扰动位形（含横向起伏）：L 必须逐位不变。
+  for (int v = 0; v < m.vertexCount(); ++v) {
+    const Scalar i = static_cast<Scalar>(v % nx);
+    const Scalar j = static_cast<Scalar>(v / nx);
+    m.positions[static_cast<std::size_t>(v)] +=
+        Vec3{0.03 * std::sin(i), 0.05 * std::cos(j), 0.02 * std::sin(i + j)};
+  }
+  Eigen::SparseMatrix<Scalar> l2;
+  std::vector<Scalar> rhs2;
+  assembleLeftHandSide(m, h, 0.0, l2, &rhs2);
+
+  CHECK(l1.rows() == l2.rows() && l1.cols() == l2.cols());
+  CHECK(l1.nonZeros() == l2.nonZeros());
+  bool identical = true;
+  for (int kk = 0; kk < l1.outerSize() && identical; ++kk) {
+    for (Eigen::SparseMatrix<Scalar>::InnerIterator it(l1, kk); it; ++it) {
+      if (it.value() != l2.coeff(it.row(), it.col())) identical = false;
+    }
+  }
+  CHECK_MSG(identical, "改位形后弯曲的左端块必须逐位不变（这是「只分解一次」的前提）");
+
+  // 常向量只依赖 **pin 位置**：位形变了它必须不变。
+  Mesh m3 = Mesh::makeGrid(nx, ny, 0.05);
+  m3.addBendingStencils(nx, ny, k);
+  m3.pinned[5 * nx + 5] = 1;
+  m3.pinPositions = m3.positions;
+  std::vector<Scalar> rA;
+  assembleBendingRhs(m3, rA);
+  CHECK_MSG(rA == rhs1, "同一场景下两次装配的常向量必须逐位相同");
+  for (int v = 0; v < m3.vertexCount(); ++v) {
+    m3.positions[static_cast<std::size_t>(v)] += Vec3{0.1, -0.2, 0.3};
+  }
+  std::vector<Scalar> rB;
+  assembleBendingRhs(m3, rB);
+  CHECK_MSG(rA == rB, "弯曲常向量只依赖 pin 位置 ⇒ 改位形必须逐位不变");
+
+  // 量级与方向的可分辨性：非平坦位形下弯曲力随刚度单调变强、方向始终朝 -y。
+  Mesh soft = makeThreePointChain(0.1, 0.02, 10.0);
+  Mesh hard = makeThreePointChain(0.1, 0.02, 10.0e3);
+  const double softY = static_cast<double>(referenceBendForce(soft, 1).y);
+  const double hardY = static_cast<double>(referenceBendForce(hard, 1).y);
+  CHECK_MSG(hardY < softY && softY < 0.0,
+            "弯曲力必须随刚度单调变强，且方向始终朝 -y（回复力）");
+}
+
 TEST_MAIN("primitives/distance_term")

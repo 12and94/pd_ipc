@@ -101,6 +101,23 @@ struct SceneConfig {
   /// "与位形无关、只分解一次"与 `L = Ã ⊗ I₃` 这两条架构性质。
   Scalar shearStiffness = 0.0;
 
+  /// **线性（中点）弯曲约束的刚度 k**：> 0 时沿每一行/列给连续三个顶点生成弯曲 stencil
+  /// （见 `Mesh::addBendingStencils` 与 `BendStencil`），提供抗弯刚度 —— 布料会自己
+  /// 挺起来/保留褶皱，而不是像面条一样只靠距离约束。
+  ///
+  /// **默认 0 = 不启用**：此时 `mesh.bends` 为空、装配与残差都不多算任何一项，
+  /// 行为与改动前**逐字相同**（已用 `build/_baseline/pd_bench_pre_fuse.exe` 逐字比对）。
+  ///
+  /// 两条架构性质不受影响（这是选"中点形式"而不是二面角形式的理由）：
+  /// ① A_c 是常数矩阵 ⇒ L 与位形无关 ⇒ 仍然只分解一次；
+  /// ② 每块是 `k·w_p·w_q·I₃` ⇒ 仍是标量 × I₃ ⇒ `L = Ã ⊗ I₃` 与三分量并行保住。
+  ///
+  /// ⚠️ **量纲提醒（局限，不是 bug）**：`‖A_c x‖²` 里有两个位移差分，所以这条约束的
+  /// 等效抗弯刚度 **∝ s⁴ / k**（s = 网格间距）—— 弯曲刚度是**网格相关**的，
+  /// 换间距/分辨率必须重新标定，而且它会把弯曲刚度与间距耦合成"同一个 k 在不同网格上
+  /// 手感不同"。要尺度无关得改成 `k·s⁴`（或按质量参数化，与 κ 的处理原则一致）。
+  Scalar bendStiffness = 0.0;
+
   // ---- 诊断 ----
   bool verbose = false;
   int reportEvery = 0;  ///< >0 时每 N 步打印一次状态
@@ -146,6 +163,16 @@ struct SimContext {
   Eigen::VectorXd bBase;        ///< 惯性右端 (M/h²)x̂，每迭代从它拷贝
   Eigen::VectorXd xSolution;    ///< 全局步解（按 [x,y,z] 连续存放）
   Eigen::SparseMatrix<Scalar> L;///< 全局矩阵（数值只在 stamp 变化时重装）
+
+  /// **线性（中点）弯曲的常向量右端**（尺寸 3N，按自由度索引）。
+  /// 与位形无关（只有 stencil 里含 pinned 顶点时才非零），每子步由
+  /// `assembleBendingRhs()` 重算一次（O(B)，可忽略），进区域前完成 ⇒ 无竞争。
+  ///
+  /// 为什么是**每子步**重算而不是"随 L 一起只算一次"：它依赖 `pinPositions`，而拖拽把手
+  /// **只改 b、不改 L**（docs/plan.md §2.2.1 的约定），所以"pin 位置变了但 stamp 没变"
+  /// 是常态 —— 那时若沿用旧的常向量，自由端的右端就少了 pin 的当前位置信息。
+  /// 没有弯曲约束时它恒为空 vector，`data()` 为 nullptr，热路径上等于不存在。
+  std::vector<Scalar> bendRhs;
 
   StageTimes times;
   double lastStepSeconds = 0.0;

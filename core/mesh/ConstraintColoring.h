@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "core/math/Vec3.h"  // Scalar（BendAdjacency 的权重数组要用）
+
 namespace pd {
 
 class Mesh;  // 前向声明：着色结果本身不需要 Mesh 的完整定义（避免头文件循环依赖）
@@ -52,6 +54,32 @@ struct ConstraintColoring {
   uint32_t end(int c) const { return start[static_cast<std::size_t>(c) + 1]; }
 };
 
+/// 顶点 → 关联**弯曲 stencil** 的 CSR（拓扑级数据，与 `ConstraintColoring` 同生命周期）。
+///
+/// 为什么需要它：弯曲约束**没有局部步、没有散射**（投影恒为 0），它唯一的全部影响在
+/// 左端矩阵、右端常向量与**残差**上。前两者在装配期一次算完，而残差是**每迭代**都要算的、
+/// 而且必须是"逐顶点 gather"形态（Phase 3 的残差数据流）：所以这里要有一张
+/// "顶点 v 关联哪些 stencil"的表，让每个顶点能独立地把自己那份弯曲力算出来。
+///
+/// 结构：
+///   · `vertexStart[v] .. vertexStart[v+1]` —— 顶点 v 关联的 stencil 号区间；
+///   · `vertexStencils[k]`     —— 第 k 个关联项的 stencil 号；
+///   · `vertexStencilWeight[k]` —— 该 stencil 里顶点 v 的权重 w_v ∈ {1, -2, 1}。
+///
+/// 权重必须一起存：顶点 v 的弯曲力是 `-Σ k·w_v·(Σ_t w_t x_t)`，其中 `w_v` 只由
+/// "v 在 stencil 里是 a、b 还是 c"决定。残差里没有别的信息能推出它（stencil 的顶点号
+/// 顺序才是权威，但那样要在热路径里做三次比较）。三个顶点各出现一次 ⇒
+/// `vertexStencils.size() == 3 * bendCount`。
+///
+/// **填表顺序是按 stencil 号升序**（cursor 顺序遍历 bends）—— 与"串行版按全局 stencil 序
+/// 累加进 force[v]"是同一个累加顺序，因此串行残差与 gather 残差**逐位相同**。
+/// 这一点与 `vertexEdges` 的约定完全一样（见 ConstraintColoring.cpp 的 buildAdjacency）。
+struct BendAdjacency {
+  std::vector<uint32_t> vertexStart;          ///< 大小 vertexCount+1
+  std::vector<uint32_t> vertexStencils;       ///< 长度 = 3 * bendCount（每个 stencil 出现 3 次）
+  std::vector<Scalar> vertexStencilWeight;    ///< 与 vertexStencils 一一对应：w_v ∈ {1,-2,1}
+};
+
 /// 并行地给约束着色（Jones–Plassmann 风格：优先级 + "最小可用颜色"）。
 ///
 /// 算法（每轮并行一趟，串行应用一趟）：
@@ -75,5 +103,15 @@ struct ConstraintColoring {
 ///
 /// 复杂度：O(轮数 · E · Δ)，一次性成本，不进帧预算。
 void buildConstraintColoring(const Mesh& mesh, ConstraintColoring& out);
+
+/// 构建"顶点 → 关联弯曲 stencil"的 CSR（见 `BendAdjacency`）。
+///
+/// 与着色一样是**拓扑级**的：只依赖 `mesh.bends` 与顶点数，与位形/刚度/pin 掩码无关，
+/// 因此由 `Mesh::buildSparsityPattern()` 一并调用（改拓扑后必须重建，否则残差的 gather
+/// 会拿过期的 CSR 当循环边界 —— 越界读，实测表现为"卡住不返回"）。
+///
+/// 0 条 stencil 时也必须把 `vertexStart` 填成 `vertexCount+1` 个零：
+/// 残差的 gather 直接拿它当循环边界，空表与"没有表"在越界读这件事上没有区别。
+void buildBendAdjacency(const Mesh& mesh, BendAdjacency& out);
 
 }  // namespace pd

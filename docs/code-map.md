@@ -66,9 +66,9 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
-| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、稀疏结构 `buildSparsityPattern()`、**约束着色**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
-| `core/mesh/ConstraintColoring.h/.cpp` | 约束（边）的图着色：同色边两两不共享顶点 —— 散射据此按颜色分组执行，**无需归约/原子加**。并行 Jones–Plassmann（优先级哈希 + 最小可用颜色），颜色数 ≤ Δ+1，同色内按顶点序排列（避免假共享）。**拓扑级数据**，随 `buildSparsityPattern()` 构建 | 散射的正确性与性能 |
-| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + 阶段耗时）、`StageTimes` | — |
+| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、**弯曲 stencil 表**（`BendStencil` / `bends` / `addBendingStencils`）、稀疏结构 `buildSparsityPattern()`、**约束着色与顶点关联表**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
+| `core/mesh/ConstraintColoring.h/.cpp` | 约束（边）的图着色：同色边两两不共享顶点 —— 散射据此按颜色分组执行，**无需归约/原子加**。并行 Jones–Plassmann（优先级哈希 + 最小可用颜色），颜色数 ≤ Δ+1，同色内按顶点序排列（避免假共享）。**拓扑级数据**，随 `buildSparsityPattern()` 构建。<br>**另有 `BendAdjacency`**（顶点→弯曲 stencil 的 CSR，带 `w_v ∈ {1,-2,1}`）与 `buildBendAdjacency()`：弯曲没有散射，这张表**只给残差**用（每个顶点独立算自己那份弯曲力），同样随 `buildSparsityPattern()` 构建 | 散射的正确性与性能；残差口径 |
+| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差 / **`shearStiffness` / `bendStiffness`：两个可选约束，默认 0 = 关闭**）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + **`bendRhs`** + 阶段耗时）、`StageTimes` | — |
 | `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()` | 6、7 |
 
 > **`pinPositions` 契约（踩过坑）**：一旦 `mesh.pinned` 里有 1，`pinPositions` 就必须按顶点数填好，
@@ -101,7 +101,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
-| `core/assemble/Assembler.h/.cpp` | `computeStamp()`（判定何时需要重新分解：拓扑/刚度/质量/h/pin/阻尼）、`assembleLeftHandSide()`（$M/h^2+\sum\kappa A^\top A$ + pinned 行覆盖）、`assembleInertialRhs()`（右端 $(M/h^2)\hat x$，**重力不在这里**）、`applyPinRhs()`（pinned 行右端置为把手位置）、`pack/unpackPositions` | 3、7 |
+| `core/assemble/Assembler.h/.cpp` | `computeStamp()`（判定何时需要重新分解：拓扑/刚度/**弯曲刚度**/质量/h/pin/阻尼）、`computeStructureStamp()`（+**弯曲 stencil 顶点三元组**：结构变了必须重新符号分解）、`assembleLeftHandSide()`（$M/h^2+\sum\kappa A^\top A$ + **弯曲块 $k\,w_pw_q I_3$** + pinned 行覆盖；可选出参 `bendingRhs`）、**`assembleBendingRhs()`**（弯曲的常向量右端，每子步重算）、`assembleInertialRhs()`（右端 $(M/h^2)\hat x$，**重力不在这里**）、`applyPinRhs()`（pinned 行右端置为把手位置）、`pack/unpackPositions` | 3、7 |
 | `core/solver/IGlobalSolver.h` | 求解器抽象：`analyze` / `factorize` / `solve` 三段 + `SolverStamp`；另有 **`parallelComponents()` / `solveComponent(c,b,x)`**（2026-09-22 起：`L = Ã ⊗ I₃` ⇒ 全局步可按 x/y/z 拆成 3 条零同步的独立链；结构不满足时返回 1 自动退回整趟）。三条路线的差异都收在这里 | 7 |
 | `core/solver/EigenDirectSolver.h/.cpp` | `Eigen::SimplicialLDLT` 实现；符号分解用**真实矩阵结构**（不能用理想块模式，否则 solve 阶段会访问越界）。<br>**2026-09-22 起 `solve` 由本文件自己实现**（前代 scatter 形式 + 预存 1/D + 回代直接扫 CSC 列），排序也由它自己调 AMD（`Eigen::AMDOrdering`）以便拿到置换：实测比 `SimplicialLDLT::solve()` 快 10–20 %（回代占单子步 76 %），且**数值与之逐位相同**。原因与踩过的坑见 `docs/perf.md` §8 | 7 |
 | `core/solver/SparsePattern.h` | `BlockEntry`（3×3 非零块的位置） | — |
@@ -134,6 +134,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | `_verify/direction_audit.cpp` | 投影方向三项判据（全局一致 / 物理合理 / 与标准 PD 逐位一致） |
 | `_verify/solve_audit.cpp` | **全局步求解器可行性审计**（`pd_solveaudit`）：延迟/带宽性质、因子层集与关键路径、换排序/分解的对照，以及"层调度并行回代"的原型（含正确性自证）。结论见 `docs/solver-feasibility.md`；**只测量，不改生产代码** |
 | `_verify/solve_components.cpp` | **全局步"按 x/y/z 三分量拆分"的验证与微基准**（`pd_solvecomp`）：① 结构自检（因子的分量块对角性、每分量 nnz 是否相等、跨分量填充必须为 0）；② "三分量分别求解"与"整趟求解"的**逐位比对**；③ 同一并行区域内交替测"整趟 / 三分量并行 / 三分量串行"。结论与前后对照见 `docs/perf.md` §9 |
+| `_verify/bend_audit.cpp` | **线性（中点）弯曲约束的代数审计**（`pd_bendaudit`）：求解器对角自检、三条链的隐式欧拉解析解（$y=\hat y\,(m/h^2)/(m/h^2+4k)$）、线性残差 $|Lx-b|$ 到机器精度、"pinned 行必须精确为单位行"、平直位形零弯曲力、弯曲力与 $-\nabla E$ 的有限差分一致、跨 x/y/z 分量填充必须为 0。**它抓到的正是"弯曲的装配规则不能照抄距离约束的跳过规则"这个坑**（见 `docs/perf.md` §12.6 局限 5） |
 
 > **以下程序是排查期留下的，前提假设部分已过期，不是受支持的验收集**（见 `README.md` §4）：
 > `one_step_trace`、`standard_pd`、`steady`、`rhs_breakdown`、`force_audit`、`kappa_effect`、
@@ -160,9 +161,10 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 #   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 136 断言（21 个测试；含并行散射、约束着色、全局步三分量拆分、投影+散射融合、剪切对角边的构造）
+.\build\Release\test_primitives.exe         # 180 断言（26 个测试；含并行散射、约束着色、全局步三分量拆分、投影+散射融合、剪切对角边、**线性中点弯曲**）
 .\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
 .\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
+# 合计 350 断言
 
 # ---- 专项验证 ----
 .\build\Release\pd_diraudit.exe       # 投影方向：全局一致性 / 物理合理性 / 标准 PD 一致性
@@ -243,7 +245,7 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 | `pd_trans` | 平移一致性：pin 在任意位置下静止位移严格为 0；平移系统后相对形状不变 | 全过 |
 | `pd_chain` | 长链条对照解析解：自由链长度精确不变；悬挂链伸长与 $mg\,N(N-1)/(2\kappa)$ 吻合 | 全过 |
 | `pd_diraudit` | 方向三项：全局一致 / 物理合理 / 与标准 PD 逐位一致 | 全过 |
-| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | 125 + 155 + 15 断言 | 全绿 |
+| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | **180** + 155 + 15 = **350 断言** | 全绿 |
 
 **实测性能**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束）
 查看器 `--frames 400` 实测 60 FPS（vsync 封顶）、稳态物理 1.9 ms/帧、迭代 1 次、
@@ -259,12 +261,15 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 
 **已知不足**（不是缺陷，是尚未实现）：
 
-1. 材质模型只有 4-邻域距离约束，**没有对角连接、没有弯曲项** —— 四边形可自由剪切成菱形，
-   抗剪切/抗弯不足，折叠与自穿插都无法阻止；
+1. 材质模型默认只有 4-邻域距离约束；**对角剪切**与**线性中点弯曲**都已实现但**默认关闭**
+   （`shearStiffness` / `bendStiffness`，见 `docs/perf.md` §11/§12）—— 开启后仍**没有碰撞**，
+   所以折叠与自穿插依旧无法阻止；弯曲的边界是自由端（边缘一圈不会自己挺起来）、
+   且**不能表达目标曲率/预折痕**；
 2. **没有碰撞处理**（IPC 暂缓，见 `docs/design-discussion.md`）；
 3. **刚度标定未最终确定**：$\kappa$ 与顶点质量的量级需按目标网格配好，
    否则布料在自重下会明显伸长。正确做法是把刚度按质量参数化（$\kappa=k_{\rm mat}\cdot m$），
    而不是按长度（曾经按 $\mathrm{spacing}^2$ 缩放过，是错的，已撤掉）。
+   弯曲刚度同理且更严重：它的等效抗弯刚度 $\propto s^4/k$，换网格必须重新标定。
 
 **文档注意**：`README.md` 与 `docs/plan.md` 里关于"重力只出现在预测里"的结论是对的，
 早期文档曾写过"右端要补 $-Mg$"，那**是错的**（等于把重力算两遍），已全部更正。

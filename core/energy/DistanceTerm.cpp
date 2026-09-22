@@ -200,8 +200,9 @@ void DistanceTerm::project(const Mesh& mesh, std::vector<Vec3>& targets) {
 }
 
 void DistanceTerm::scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>& targets,
-                                       const Scalar* base, Scalar* b, std::size_t dim) {
-  // 语义：b = base + Σ_c κ_c (A_cᵀ d_c)。base == b 表示"累加到现有值"
+                                       const Scalar* base, Scalar* b, std::size_t dim,
+                                       const Scalar* extraRhs) {
+  // 语义：b = base + extraRhs + Σ_c κ_c (A_cᵀ d_c)。base == b 表示"累加到现有值"
   // （独立入口 scatterInto 复用这条实现时用），此时要求 b 已是基值。
   const bool accumulateOnly = (base == b);
 
@@ -214,12 +215,19 @@ void DistanceTerm::scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>
   const ConstraintColoring& coloring = mesh.constraintColoring();
 
   if (!accumulateOnly) {
-    // 种子趟：b = base。取代了旧方案的"每线程一份全维缓冲清零 + 归约"（O(P·dim)），
+    // 种子趟：b = base + extraRhs。取代了旧方案的"每线程一份全维缓冲清零 + 归约"（O(P·dim)），
     // 这一趟只有 O(dim) —— 这就是 Phase 2 省下来的主要流量。
+    //
+    // `extraRhs` 就是**线性（中点）弯曲的常向量**（见 Assembler.h 的推导）：它与位形无关，
+    // 所以在唯一一处"b 被整个覆盖"的地方顺手加上，每迭代自动重新加一遍，**零额外 barrier**。
+    // 不要在热循环里判 `extraRhs` 是否为空以外的任何条件 —— 按 docs/perf.md §7.3 的教训，
+    // 每次迭代都跑的代码里加任何一点东西都可能被编译器的布局变化放大。
 #ifdef _OPENMP
 #pragma omp for
 #endif
-    for (long long i = 0; i < static_cast<long long>(dim); ++i) b[i] = base[i];
+    for (long long i = 0; i < static_cast<long long>(dim); ++i) {
+      b[i] = base[i] + (extraRhs ? extraRhs[i] : Scalar{0});
+    }
   }
 
   // 逐色累加：同色边两两不共享顶点 ⇒ 并发写 b **没有任何冲突**，不需要私有缓冲、
@@ -250,7 +258,7 @@ void DistanceTerm::scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>
 }
 
 void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& targets, Scalar* b,
-                               std::size_t dim) {
+                               std::size_t dim, const Scalar* extraRhs) {
   const int ne = mesh.edgeCount();
   // 懒构建兜底：**必须在进区域之前**（见 Mesh::ensureConstraintColoring 的说明）。
   mesh.ensureConstraintColoring();
@@ -262,13 +270,14 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
 #pragma omp parallel num_threads(numThreads()) if (useParallel)
 #endif
   {
-    // base == b ⇒ 累加到现有值，与改造前 parallel 分支的语义相同。
-    scatterIntoInRegion(mesh, targets, b, b, dim);
+    // base == b ⇒ 累加到现有值，与改造前 parallel 分支的语义相同
+    // （此时 extraRhs 被忽略 —— 调用方必须先把它加进 b 的基值里）。
+    scatterIntoInRegion(mesh, targets, b, b, dim, extraRhs);
   }
 }
 
 void DistanceTerm::projectAndScatterIntoInRegion(const Mesh& mesh, const Scalar* base, Scalar* b,
-                                                std::size_t dim) {
+                                                std::size_t dim, const Scalar* extraRhs) {
   // 与 scatterIntoInRegion 同一套契约与前置检查（各查一次，O(1)，非热路径）。
   const bool accumulateOnly = (base == b);
   if (threadId() == 0) {
@@ -279,13 +288,16 @@ void DistanceTerm::projectAndScatterIntoInRegion(const Mesh& mesh, const Scalar*
   const ConstraintColoring& coloring = mesh.constraintColoring();
 
   if (!accumulateOnly) {
-    // 种子趟：b = base（保留不动 —— 它只有 O(dim) 流量与 1 个 barrier，
+    // 种子趟：b = base + extraRhs（extraRhs = 弯曲的常向量，见 Assembler.h）。
+    // 保留不动 —— 它只有 O(dim) 流量与 1 个 barrier，
     // 而"把首色并进基数写"需要在每条边的热循环里判"该顶点是否首次被触碰"，
-    // 按 docs/perf.md §7.3 的教训（热循环里加一点点东西都可能被布局放大）不划算）。
+    // 按 docs/perf.md §7.3 的教训（热循环里加一点点东西都可能被布局放大）不划算。
 #ifdef _OPENMP
 #pragma omp for
 #endif
-    for (long long i = 0; i < static_cast<long long>(dim); ++i) b[i] = base[i];
+    for (long long i = 0; i < static_cast<long long>(dim); ++i) {
+      b[i] = base[i] + (extraRhs ? extraRhs[i] : Scalar{0});
+    }
   }
 
   // 逐色融合：同色内的边两两不共享顶点 ⇒ 就地算投影、直接累加**没有任何冲突**。

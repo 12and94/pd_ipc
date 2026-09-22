@@ -64,6 +64,33 @@ SimContext makeScene(const SceneConfig& config) {
     }
   }
 
+  // ---- 线性（中点）弯曲约束：可选，默认关闭（`SceneConfig::bendStiffness == 0`）----
+  //
+  // 位置刻意放在**质量计算之后、pin 之前**：
+  //   · 在质量之后 —— 弯曲 stencil 不参与质量计算（与剪切同理），所以"带弯曲"与
+  //     "不带弯曲"的场景质量逐位相同，对照实验里唯一的变量就是约束集；
+  //   · 在 pin 之前 —— stencil 的生成只沿行/列取连续三个顶点，与 pin 标记无关，
+  //     放在 pin 前后结果等价；这样排是为了让"网格构造"（质量 → 剪切 → 弯曲）成一段、
+  //     pin 只负责标记。
+  //
+  // 为什么弯曲**没有**对应的投影/散射代码：它的流形是 {x : A_c x = 0}（线性子空间），
+  // 投影 p_c ≡ 0 ⇒ 局部步无事可做；右端只多一个与位形无关的常向量（装配期算一次）。
+  // 所以这里只需要"生成 stencil"这一步，其余全在装配（Assembler）与残差（Integrator）里。
+  // 环境变量 `PD_BEND=<刚度>` 可临时开启（照抄 `PD_SHEAR` 的位置与写法，便于 bench/viewer
+  // 做对照而不用扩命令行解析）。
+  {
+    Scalar bend = config.bendStiffness;
+    if (const char* env = std::getenv("PD_BEND")) {
+      const double v = std::atof(env);
+      if (v > 0.0) bend = static_cast<Scalar>(v);
+    }
+    if (bend > 0.0 && config.meshPath.empty()) {
+      const int added = ctx.mesh.addBendingStencils(config.gridNx, config.gridNy, bend);
+      std::printf("[scene] 弯曲约束：新增 stencil %d 条（刚度 %g）\n", added,
+                  static_cast<double>(bend));
+    }
+  }
+
   // ---- 默认 pin：规则网格把顶边（j = ny-1）两端的顶点钉住 ----
   // 对 OBJ 载入的网格，调用方可通过 config 之后的接口自行设置 pin。
   if (config.meshPath.empty() && config.gridNx >= 2 && config.gridNy >= 2) {
@@ -96,6 +123,14 @@ void ensureBuffers(SimContext& ctx) {
   if (static_cast<std::size_t>(ctx.b.size()) != dim) ctx.b.resize(dim);
   if (static_cast<std::size_t>(ctx.bBase.size()) != dim) ctx.bBase.resize(dim);
   if (static_cast<std::size_t>(ctx.xSolution.size()) != dim) ctx.xSolution.resize(dim);
+  // 弯曲常向量：**只在真的用了弯曲约束时才分配**。空 vector 的 data() 是 nullptr，
+  // 热路径上 `extraRhs ? ... : 0` 直接走"没有额外项"的分支 ⇒ 默认关闭时逐字不变。
+  // 注意别写成"每子步都 assign/shrink"：本函数每次 stepOnce 都调用，那会把 O(dim) 的
+  // 无谓工作放进热路径（`ensureBuffers` 的既有约定是"幂等且只在尺寸不对时才动"）。
+  {
+    const std::size_t want = (ctx.mesh.bendCount() > 0) ? dim : std::size_t{0};
+    if (ctx.bendRhs.size() != want) ctx.bendRhs.assign(want, Scalar{0});
+  }
   if (!ctx.solver) ctx.solver = std::make_unique<EigenDirectSolver>();
 }
 

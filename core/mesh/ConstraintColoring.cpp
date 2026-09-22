@@ -79,6 +79,45 @@ inline bool better(uint32_t ea, uint32_t eb, const std::vector<uint32_t>& prio) 
 
 }  // namespace
 
+void buildBendAdjacency(const Mesh& mesh, BendAdjacency& out) {
+  // 与 buildAdjacency 同一套做法（计数 → 前缀和 → cursor 填表），只是"边"换成"stencil"、
+  // 并且每个 (stencil, 顶点) 关联项还要带一个权重。
+  //
+  // **填表顺序必须按 stencil 号升序**：残差的串行口径是"按全局 stencil 序把力累加进
+  // force[v]"，gather 口径是"顶点 v 按 vertexStencils 的次序累加"；两者只有在
+  // "关联项按 stencil 号升序"时才逐位相同（与 Phase 3 的残差契约一致，见 Integrator.cpp）。
+  const int nv = mesh.vertexCount();
+  const int nb = mesh.bendCount();
+  out.vertexStart.assign(static_cast<std::size_t>(nv) + 1, 0);
+
+  for (const BendStencil& s : mesh.bends) {
+    out.vertexStart[static_cast<std::size_t>(s.a) + 1] += 1;
+    out.vertexStart[static_cast<std::size_t>(s.b) + 1] += 1;
+    out.vertexStart[static_cast<std::size_t>(s.c) + 1] += 1;
+  }
+  for (int v = 0; v < nv; ++v) {
+    out.vertexStart[static_cast<std::size_t>(v) + 1] += out.vertexStart[static_cast<std::size_t>(v)];
+  }
+  const std::size_t total = static_cast<std::size_t>(3) * static_cast<std::size_t>(nb);
+  out.vertexStencils.assign(total, 0);
+  out.vertexStencilWeight.assign(total, 0.0);
+  if (nb <= 0) return;
+
+  std::vector<uint32_t> cursor(out.vertexStart.begin(), out.vertexStart.end() - 1);
+  for (int i = 0; i < nb; ++i) {
+    const BendStencil& s = mesh.bends[static_cast<std::size_t>(i)];
+    const uint32_t stencil = static_cast<uint32_t>(i);
+    // 权重就是 A_c 的三个系数 {1, -2, 1}，按 (a, b, c) 的顺序。
+    const int vertex[3] = {s.a, s.b, s.c};
+    const Scalar weight[3] = {1.0, -2.0, 1.0};
+    for (int k = 0; k < 3; ++k) {
+      const std::size_t slot = cursor[static_cast<std::size_t>(vertex[k])]++;
+      out.vertexStencils[slot] = stencil;
+      out.vertexStencilWeight[slot] = weight[k];
+    }
+  }
+}
+
 void buildConstraintColoring(const Mesh& mesh, ConstraintColoring& out) {
   const int ne = mesh.edgeCount();
   out.colorOf.assign(static_cast<std::size_t>(ne), kUncolored);

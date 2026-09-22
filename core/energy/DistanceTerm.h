@@ -1,5 +1,7 @@
 // core/energy/DistanceTerm.h
-// 首期唯一的能量项：距离约束（弹簧）。
+// 首期唯一的能量项：距离约束（弹簧）。**线性（中点）弯曲不在这里** —— 它没有局部步、
+// 没有散射，全部影响只在装配（`core/assemble/Assembler.cpp` 的 (2b)）与残差上，
+// 理由见 `core/mesh/Mesh.h` 的 `BendStencil`。
 //
 // 能量形式（docs/plan.md §2.2.1）：
 //   A_c x = x_a - x_b
@@ -40,11 +42,23 @@ class DistanceTerm {
   /// 用裸指针而不是 Eigen 类型，是为了让 GPU 后端也能共用同一份语义。
   /// 内部使用"线程私有缓冲 + 固定顺序归约"，不做浮点原子加（决策 D6）。
   ///
+  /// `extraRhs`（可选，默认 nullptr ⇒ 行为与改动前逐字相同）：**与位形无关的额外右端项**，
+  /// 由种子趟一次加上（`b[i] = base[i] + extraRhs[i]`）。目前唯一的用途是线性（中点）弯曲
+  /// 约束的常向量贡献（stencil 里含 pinned 顶点时的消元补偿，见 Assembler.h）。
+  ///
+  /// 为什么它必须走种子趟、而不能在自己的那一趟里加：种子趟是**唯一**一处"b 被整个覆盖"
+  /// 的地方，所以任何"与位形无关、每迭代都一样"的项放在这里就自动满足"每迭代重新加一遍"
+  /// 的要求（b 每迭代都要从 base 重建）。放在别处就要么得多一个 barrier，要么会被下一次
+  /// 种子趟冲掉。它不引入任何额外同步，也不改变求和顺序。
+  ///
+  /// 语义上 `extraRhs` 只在 `base != b`（即种子趟真的执行）时有意义；`base == b` 表示
+  /// "累加到现有值"，此时 extraRhs 被忽略（正是 `scatterInto` 复用这条实现时的情况）。
+  ///
   /// 前置条件：若 mesh 里有 pinned 顶点，`mesh.pinPositions` 必须已按顶点数填充
   /// （正常流程由 makeScene / refreshPinPositions 保证）。违反时本函数会立即
   /// 报错退出，而不是靠越界读把问题变成难以定位的崩溃。
   static void scatterInto(const Mesh& mesh, const std::vector<Vec3>& targets, Scalar* b,
-                          std::size_t dim);
+                          std::size_t dim, const Scalar* extraRhs = nullptr);
 
   /// 组装全局矩阵的数值部分（不含 M/h² 与 pinned 行——那些由组装器统一处理）。
   /// 调用方需保证 triplets 已清空；本函数只做追加。
@@ -80,8 +94,11 @@ class DistanceTerm {
   ///
   /// base 与 b 必须都能访问 3*vertexCount 个元素；`base == b` 表示"累加到现有值"
   /// （独立入口 `scatterInto` 复用这条实现时用）。
+  ///
+  /// `extraRhs`（可选，默认 nullptr）见 `scatterInto` 的说明；它只在种子趟生效。
   static void scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>& targets,
-                                  const Scalar* base, Scalar* b, std::size_t dim);
+                                  const Scalar* base, Scalar* b, std::size_t dim,
+                                  const Scalar* extraRhs = nullptr);
 
   /// **融合的"投影 + 散射"**（2026-09-22 新增）：按颜色就地算 d_c 并直接累加到两端点，
   /// 不再物化 `targets` 中间量。语义与"`projectInRegion` 之后再 `scatterIntoInRegion`"等价，
@@ -90,8 +107,11 @@ class DistanceTerm {
   ///
   /// 省的账（40×40，每迭代）：`targets` 的写 + 读各 3120×24 B ≈ 75 KB、两个端点位置少读一遍。
   /// 与 `scatterIntoInRegion` 一样，**必须在并行区域内**调用（内部是 `omp for`）。
+  ///
+  /// `extraRhs`（可选，默认 nullptr）见 `scatterInto` 的说明：与位形无关的常数右端
+  /// （线性中点弯曲的常向量）在种子趟里加进去，**不需要任何额外 barrier**。
   static void projectAndScatterIntoInRegion(const Mesh& mesh, const Scalar* base, Scalar* b,
-                                            std::size_t dim);
+                                            std::size_t dim, const Scalar* extraRhs = nullptr);
 };
 
 }  // namespace pd

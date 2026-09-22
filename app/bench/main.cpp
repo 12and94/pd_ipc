@@ -196,7 +196,8 @@ int main(int argc, char** argv) {
 
   const auto& st = ctx.solver->stats();
   std::printf("\n--- 分解复用（方向 1 的核心）---\n");
-  std::printf("  L 自由度 %d  nnz %lld\n", 3 * ctx.mesh.vertexCount(), st.nnz);
+  std::printf("  L 自由度 %d  nnz %lld（结构）  因子 nnz %lld\n", 3 * ctx.mesh.vertexCount(), st.nnz,
+              st.factorNnz);
   std::printf("  符号分解 %d 次  数值分解 %d 次  回代 %d 次\n", st.analyzeCalls, st.factorizeCalls,
               st.solveCalls);
   std::printf("  符号分解耗时 %.3f ms\n", st.lastAnalyzeSeconds * 1e3);

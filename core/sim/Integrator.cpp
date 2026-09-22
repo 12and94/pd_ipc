@@ -55,7 +55,7 @@ constexpr int kMinParallelWork = 512;
 ///
 /// 推导：本子步的不动点条件是（自由顶点，见 docs/plan.md §2.2.1）
 ///     (m_i/h²)(x_i - x̂_i) - m_i·g - f_i^int = 0
-/// 其中距离约束的弹性力 f_i^int 等于"散射进右端的那一项"的相反数：
+/// 其中弹性力 f_i^int 等于"散射进右端的那一项"的相反数：
 ///     f_i^int = -Σ_c κ_c d_c(x)   （a 端 +κd_c、b 端 -κd_c）
 /// 于是每个顶点的不平衡加速度为
 ///     r_i = |(m_i/h²)(x_i - x̂_i) + Σ_c κ_c d_c| / m_i
@@ -63,15 +63,57 @@ constexpr int kMinParallelWork = 512;
 /// （在右端再补 -Mg 就是把重力算两遍，本项目踩过这个坑）。x 到达不动点时
 /// 上式整体为 0，因此它就是"离不动点还有多远"的度量。
 ///
+/// ---- 为什么**必须**把弯曲力算进来（改了残差口径的原因，务必保留）----
+/// 残差是**唯一放行判据**（`cfg.residualTolerance > 0` 时位移判据完全不参与判定）。
+/// 所以"残差里少算一项力"不是"报告得好看一点"，而是**直接改变了哪些子步被放行**：
+///   · 少了弯曲项 ⇒ 一个明显还受弯的子步会被判"已收敛"⇒ **假阴性**；
+///   · 仓库的既有立场是"假阴性比假阳性更危险"（见本函数下面那段 targets 过期的说明、
+///     以及 docs/perf.md §7.1 的两口径自查），因为假阳性只是浪费迭代，假阴性是把
+///     错的位形当成答案交出去，而且**不会有任何症状**。
+/// 弯曲力的形式：顶点 v 的力 = Σ_{stencil 含 v} (-k·w_v·(Σ_t w_t x_t))，w = {1,-2,1}。
+/// 它**线性且与位形无关地可算**，所以残差里就地重算即可（不需要任何中间量）。
+///
 /// 为什么不能用"相邻迭代位移"代替它：位移小只说明这一步没怎么动。
 /// 高刚度下更新量是被 L 预条件后的梯度，小更新不保证小物理残差
 /// （κ=1e5 时 40 次迭代只完成切向运动的 0.46%，而位移看起来"已经很小"）。
+
+/// 顶点 v 的**弯曲力**（A_c 形式，全项目唯一口径）。
+///
+/// 串行残差（`nonlinearResidual`）与 gather 残差（`vertexResidual`）**共用本函数**：
+/// 所以"两条残差口径逐位相同"在这条路径上是**构造性**的，不是靠在两处各写一份、
+/// 再靠两张 CSR 的填表顺序一致去论证。这是本次改动刻意选的写法 ——
+/// 残差里加项本身就是最容易出"两条路慢慢分叉"的地方。
+///
+/// 权重 w_v 由关联表带着走（`BendAdjacency::vertexStencilWeight`）：v 是 stencil 的
+/// a/b/c 时 w_v 分别是 1/-2/1。三者的符号不同，所以不能只记 stencil 号 ——
+/// "按顶点号的大小猜自己是哪一端"在一般情况下就是错的（stencil 的 (a,c) 顺序由生成器
+/// 决定，不代表几何位置），那种简化会静默地把中间顶点的 -2 变成 +1。
+inline Vec3 bendForceAt(const Mesh& mesh, const BendAdjacency& bendAdj, const Scalar* xSol, int v) {
+  Vec3 force{0, 0, 0};
+  if (bendAdj.vertexStencils.empty()) return force;  // 没有弯曲约束：零开销、默认关闭时逐字不变
+  const std::size_t i = static_cast<std::size_t>(v);
+  for (uint32_t k = bendAdj.vertexStart[i]; k < bendAdj.vertexStart[i + 1]; ++k) {
+    const BendStencil& s = mesh.bends[bendAdj.vertexStencils[k]];
+    const Scalar* xa = xSol + static_cast<std::size_t>(s.a) * 3;
+    const Scalar* xb = xSol + static_cast<std::size_t>(s.b) * 3;
+    const Scalar* xc = xSol + static_cast<std::size_t>(s.c) * 3;
+    // A_s x = x_a - 2 x_b + x_c，逐分量写开（不写 Vector 表达式，避免 vtable 之外的
+    // 运算符重载把 `-2*x_b` 算成别的结合顺序；与 surrogateEnergy 里那一处同形）。
+    const Vec3 second{xa[0] - 2.0 * xb[0] + xc[0], xa[1] - 2.0 * xb[1] + xc[1],
+                      xa[2] - 2.0 * xb[2] + xc[2]};
+    // 力 = -∇E = -k·w_v·(A_s x)
+    force += second * (-s.stiffness * bendAdj.vertexStencilWeight[k]);
+  }
+  return force;
+}
+
 }  // namespace
 
 Scalar nonlinearResidual(const SimContext& ctx) {
   const Mesh& m = ctx.mesh;
   const int n = m.vertexCount();
   const Scalar invH2 = 1.0 / (ctx.config.dt * ctx.config.dt);
+  const BendAdjacency& bendAdj = m.bendAdjacency();
 
   // 约束力的正确形式：f^int = κ(AᵀA x − Aᵀ d)，其中 d 必须是**当前位置**的投影。
   //
@@ -100,6 +142,30 @@ Scalar nonlinearResidual(const SimContext& ctx) {
     force[ib + 0] -= contrib.x;
     force[ib + 1] -= contrib.y;
     force[ib + 2] -= contrib.z;
+  }
+  // 弯曲约束的力：**必须算进来**（见本函数顶部"为什么必须把弯曲力算进来"）。
+  //
+  // 顺手把这条路径与 gather 版做成**逐位相同**：就地按 `bendForceAt(...)` 逐顶点算，
+  // 而那个 helper 也正是 gather 版用的**同一份实现** ⇒ 两边不只是"同一个公式"，
+  // 而是**同一段代码**（不留"两处各写一份、将来改一处忘另一处"的口子）。
+  // 这比"串行版按 stencil 序全局累加"更保守：后者的累加顺序与 gather 版要靠
+  // `buildBendAdjacency` 按 stencil 号升序填表来**论证**，而复用同一段代码让这一点
+  // 变成构造性的（不需要论证，也不可能不一致）。
+  //
+  // 代价：每条 stencil 的 A_s x 被它的三个顶点各算一次（共享顶点要重算）。
+  // 量级 O(3B) 次乘加，40×40 上 B = 3040，与 3120 条边的距离约束残差同阶 —— 不构成热点。
+  // 没有弯曲约束时 vertexStencils 为空，helper 立刻返回零 ⇒ 零开销、行为逐字不变。
+  if (!bendAdj.vertexStencils.empty()) {
+    // 位置一律取 xSolution（与 gather 口径一致）：它是刚做完回代的结果，
+    // 而 m.positions 要等"解包趟"才写回。两者数值相同（解包写的就是 xSolution），
+    // 但统一从一处取省掉了任何读序上的疑问。
+    const Scalar* xSol = ctx.xSolution.data();
+    for (int v = 0; v < n; ++v) {
+      const Vec3 fb = bendForceAt(m, bendAdj, xSol, v);
+      force[static_cast<std::size_t>(v) * 3 + 0] += fb.x;
+      force[static_cast<std::size_t>(v) * 3 + 1] += fb.y;
+      force[static_cast<std::size_t>(v) * 3 + 2] += fb.z;
+    }
   }
 
   Scalar worst = 0.0;
@@ -160,7 +226,8 @@ Scalar nonlinearResidual(const SimContext& ctx) {
 // （原来残差是 single 里的串行趟，且要它自己的一趟全边遍历）。
 // 两者数值上完全一致：解包趟写的就是 m.positions[i] = xSolution[i]（含 pinned 行，
 // pin 行的解被 applyPinRhs 覆盖为 q，因此 pinned 端点用 xSolution 读到的也还是 q）。
-inline Scalar vertexResidual(const Mesh& mesh, const ConstraintColoring& adj, const Scalar* xSol,
+inline Scalar vertexResidual(const Mesh& mesh, const ConstraintColoring& adj,
+                             const BendAdjacency& bendAdj, const Scalar* xSol,
                              const std::vector<Vec3>& predicted, Scalar mass, Scalar invH2, int v) {
   const std::size_t i = static_cast<std::size_t>(v);
   Vec3 force{0, 0, 0};
@@ -184,6 +251,11 @@ inline Scalar vertexResidual(const Mesh& mesh, const ConstraintColoring& adj, co
       force -= contrib;
     }
   }
+  // 弯曲力：与串行版**共用同一段代码**（`bendForceAt`），所以两者逐位相同是构造性的，
+  // 而不是"靠两张表顺序一致来论证"。漏掉这一项会让残差偏小 ⇒ 假阴性（见顶部说明）。
+  // 没有弯曲约束时 vertexStencils 为空，helper 立刻返回零 ⇒ 默认关闭时逐字不变。
+  force += bendForceAt(mesh, bendAdj, xSol, v);
+
   const Vec3 xv{xSol[3 * i + 0], xSol[3 * i + 1], xSol[3 * i + 2]};
   const Vec3 inertia = (xv - predicted[i]) * (mass * invH2);
   return length(inertia + force) / mass;
@@ -200,19 +272,38 @@ inline Scalar vertexResidual(const Mesh& mesh, const ConstraintColoring& adj, co
 void checkAdjacencyContract(const Mesh& mesh) {
   const ConstraintColoring& coloring = mesh.constraintColoring();
   const std::size_t n = mesh.positions.size();
-  if (coloring.vertexStart.size() == n + 1 &&
-      coloring.vertexEdges.size() == static_cast<std::size_t>(mesh.edgeCount()) * 2) {
-    return;
+  if (coloring.vertexStart.size() != n + 1 ||
+      coloring.vertexEdges.size() != static_cast<std::size_t>(mesh.edgeCount()) * 2) {
+    std::fprintf(stderr,
+                 "[residual] 违反前置条件：顶点关联表已过期 —— vertexStart %zu 项（期望 %zu）、"
+                 "vertexEdges %zu 项（期望 %zu）。\n"
+                 "  残差的 gather 用它当循环边界，规模不对就是越界读（实测表现为卡住不返回）。\n"
+                 "  改了拓扑（增删边/改顶点数）之后必须重新调用 Mesh::buildSparsityPattern()。\n",
+                 coloring.vertexStart.size(), n + 1, coloring.vertexEdges.size(),
+                 static_cast<std::size_t>(mesh.edgeCount()) * 2);
+    std::fflush(stderr);
+    std::abort();
   }
-  std::fprintf(stderr,
-               "[residual] 违反前置条件：顶点关联表已过期 —— vertexStart %zu 项（期望 %zu）、"
-               "vertexEdges %zu 项（期望 %zu）。\n"
-               "  残差的 gather 用它当循环边界，规模不对就是越界读（实测表现为卡住不返回）。\n"
-               "  改了拓扑（增删边/改顶点数）之后必须重新调用 Mesh::buildSparsityPattern()。\n",
-               coloring.vertexStart.size(), n + 1, coloring.vertexEdges.size(),
-               static_cast<std::size_t>(mesh.edgeCount()) * 2);
-  std::fflush(stderr);
-  std::abort();
+  // **弯曲 stencil 的关联表也要查**（同一条理由：它是残差 gather 的循环边界）。
+  // 这张表有一条额外且很容易踩的失效方式：先建好表再往 `mesh.bends` 里 push
+  //（照 Model 里的构造顺序：makeGrid → addShearDiagonals → addBendingStencils 都会重建，
+  //  但如果有人绕过这两个入口手工 push，表就停在旧规模）。
+  // 症状与"漏建 vertexEdges"完全一样 —— 越界读、卡住不返回，所以宁可在这里早失败。
+  const BendAdjacency& bendAdj = mesh.bendAdjacency();
+  if (bendAdj.vertexStart.size() != n + 1 ||
+      bendAdj.vertexStencils.size() != static_cast<std::size_t>(mesh.bendCount()) * 3 ||
+      bendAdj.vertexStencilWeight.size() != bendAdj.vertexStencils.size()) {
+    std::fprintf(stderr,
+                 "[residual] 违反前置条件：弯曲 stencil 关联表已过期 —— vertexStart %zu 项（期望 %zu）、"
+                 "vertexStencils %zu 项（期望 %zu = 3×%d 条 stencil）。\n"
+                 "  残差用它算弯曲力，规模不对就是越界读。\n"
+                 "  增删弯曲 stencil 之后必须重新调用 Mesh::buildSparsityPattern()"
+                 "（正常路径由 Mesh::addBendingStencils 自动完成）。\n",
+                 bendAdj.vertexStart.size(), n + 1, bendAdj.vertexStencils.size(),
+                 static_cast<std::size_t>(mesh.bendCount()) * 3, mesh.bendCount());
+    std::fflush(stderr);
+    std::abort();
+  }
 }
 
 void resetStageTimes(SimContext& ctx) { ctx.times = StageTimes{}; }
@@ -236,6 +327,9 @@ int stepOnce(SimContext& ctx) {
   // 约束着色的懒构建兜底（幂等、O(1) 检查）：**必须在进并行区域之前**做，
   // 否则会在区域里"一边建一边被别的线程读"。正常路径由 buildSparsityPattern 建好。
   m.ensureConstraintColoring();
+  // 弯曲 stencil 关联表的懒构建兜底（幂等、O(B)）：同一条理由，**必须在进区域之前**
+  //（残差的 gather 用它当循环边界；区域里构建会一边建一边被别的线程读）。
+  m.ensureBendAdjacency();
   checkAdjacencyContract(m);  // 残差 gather 的前置条件（一次/子步，不进每迭代热路径）
 
   // ---------------------------------------------------------------
@@ -247,11 +341,12 @@ int stepOnce(SimContext& ctx) {
     const auto t0 = Clock::now();
     const SolverStamp now = computeStamp(m, h, cfg.velocityDamping, ctx.topologyId);
     if (!ctx.stampValid || now != ctx.stamp) {
-      assembleLeftHandSide(m, h, cfg.velocityDamping, ctx.L);
+      assembleLeftHandSide(m, h, cfg.velocityDamping, ctx.L, &ctx.bendRhs);
       // 符号分解的判定与数值分解**不同**：数值分解看数值戳（刚度/mass/h），
       // 符号分解还要看**稀疏结构**。pin 掩码变化会让"两端都自由"的耦合块消失，
       // 结构随之变化 —— 那时必须重新 analyze，否则 factorize 一个结构不同的矩阵后
       // solve 会访问未定义数据（见 IGlobalSolver.h，本项目因此踩过一次访问违例）。
+      // 弯曲 stencil 的顶点三元组同理（它引入新的非零块）—— 已进 computeStructureStamp。
       const uint64_t structureNow = computeStructureStamp(m, ctx.topologyId);
       if (!ctx.solver->analyzed() || structureNow != ctx.structureStamp) {
         // 结构变了（或首次）：按**真实矩阵**的结构重新做符号分解，再数值分解。
@@ -264,6 +359,14 @@ int stepOnce(SimContext& ctx) {
       ctx.factorizeCount += 1;
       ctx.times.assemble += secondsSince(t0);
       PD_TRACE("重新组装+分解（第 %d 次）", ctx.factorizeCount);
+    } else if (!m.bends.empty()) {
+      // **弯曲的常向量必须每子步重算**（O(B)，可忽略），因为 `assembleLeftHandSide`
+      // 只在数值 stamp 变化时才跑，而它依赖 `pinPositions` —— 拖拽把手**只改 b、不改 L**
+      //（docs/plan.md §2.2.1 的约定，`stampChangesOnlyWhenLeftHandSideValuesChange` 钉住了），
+      // 于是"pin 位置变了但 stamp 没变"是常态。沿用旧的常向量会让自由端少掉 pin 的
+      // **当前位置**信息（相当于用一步之前的手把位置做消元补偿）。
+      // 没有弯曲约束时这一段整个不进（连一次 size 判断都不做）⇒ 默认关闭时行为逐字不变。
+      assembleBendingRhs(m, ctx.bendRhs);
     }
   }
 
@@ -378,7 +481,11 @@ int stepOnce(SimContext& ctx) {
       //    （"局部步"不再是独立阶段，这一趟 = 原来的局部步 + 散射）。
       {
         const auto t0 = Clock::now();
-        DistanceTerm::projectAndScatterIntoInRegion(m, ctx.bBase.data(), ctx.b.data(), dim);
+        // `bendRhs` 为空（未启用弯曲）时 data() 是 nullptr ⇒ 种子趟走"没有额外项"的分支，
+        // 与改动前的 `b[i] = base[i]` 逐字等价（这就是"默认关闭逐字不变"在热路径上的落点）。
+        DistanceTerm::projectAndScatterIntoInRegion(m, ctx.bBase.data(), ctx.b.data(), dim,
+                                                    ctx.bendRhs.empty() ? nullptr
+                                                                        : ctx.bendRhs.data());
         if (threadId() == 0) ctx.times.scatter += secondsSince(t0);
       }
 
@@ -433,6 +540,7 @@ int stepOnce(SimContext& ctx) {
       const auto tScan = Clock::now();
       const Scalar* xSol = ctx.xSolution.data();
       const ConstraintColoring& adj = m.constraintColoring();
+      const BendAdjacency& bendAdj = m.bendAdjacency();
 #ifdef _OPENMP
 #pragma omp for nowait
 #endif
@@ -449,7 +557,7 @@ int stepOnce(SimContext& ctx) {
           // 与串行版同样的跳过条件：pinned 顶点不是未知量（其行被整行覆盖），
           // 零质量顶点不参与（除零）。
           if (!m.isPinned(static_cast<int>(v)) && mass > 0.0) {
-            const Scalar r = vertexResidual(m, adj, xSol, ctx.predicted, mass, invH2,
+            const Scalar r = vertexResidual(m, adj, bendAdj, xSol, ctx.predicted, mass, invH2,
                                             static_cast<int>(v));
             // 严格大于：相同残差时保留更小顶点号（与合并顺序共同保证确定性）。
             if (r > localResidual) {
@@ -606,6 +714,19 @@ Scalar surrogateEnergy(const SimContext& ctx) {
                               ctx.mesh.positions[static_cast<std::size_t>(edge.b)]);
     const Scalar d = len - edge.restLength;
     e += 0.5 * edge.stiffness * d * d;
+  }
+  // 弯曲能量 (k/2)·‖A_s x‖²。**必须一起报**：它是真实存在的一项弹性势能，
+  // 只报距离约束那部分会让"能量守恒/单调下降"这类读数在启用弯曲后失去意义。
+  // 没有弯曲约束时下面这个循环一次都不进 ⇒ 默认关闭时与改动前逐位相同。
+  for (const auto& s : ctx.mesh.bends) {
+    // 写法与 `bendForceAt` 里逐字同形：`a - 2*b + c`（**不写成** `(a - b) + (c - b)`，
+    // 那样在浮点上不是同一个表达式，位级不同）。
+    const Vec3& pa = ctx.mesh.positions[static_cast<std::size_t>(s.a)];
+    const Vec3& pb = ctx.mesh.positions[static_cast<std::size_t>(s.b)];
+    const Vec3& pc = ctx.mesh.positions[static_cast<std::size_t>(s.c)];
+    const Vec3 second{pa.x - 2.0 * pb.x + pc.x, pa.y - 2.0 * pb.y + pc.y,
+                      pa.z - 2.0 * pb.z + pc.z};
+    e += 0.5 * s.stiffness * lengthSquared(second);
   }
   return e;
 }

@@ -206,16 +206,55 @@ int Mesh::addShearDiagonals(int nx, int ny, Scalar stiffness) {
   return added;
 }
 
+int Mesh::addBendingStencils(int nx, int ny, Scalar stiffness) {
+  if (nx < 3 && ny < 3) return 0;  // 两个方向都放不下"三个连续顶点"（单方向容得下时另一个方向自然为 0 条）
+  if (vertexCount() != nx * ny) return 0;  // 只对规则网格有意义
+  const int before = bendCount();
+  auto add = [&](int a, int b, int c) {
+    BendStencil s;
+    s.a = a;
+    s.b = b;
+    s.c = c;
+    s.stiffness = stiffness;
+    bends.push_back(s);
+  };
+  // 行方向：固定 j，i = 1..nx-2。索引约定 v = j*nx + i（与 makeGrid 一致）。
+  for (int j = 0; j < ny; ++j) {
+    for (int i = 1; i + 1 < nx; ++i) add(j * nx + i - 1, j * nx + i, j * nx + i + 1);
+  }
+  // 列方向：固定 i，j = 1..ny-2。
+  for (int i = 0; i < nx; ++i) {
+    for (int j = 1; j + 1 < ny; ++j) add((j - 1) * nx + i, j * nx + i, (j + 1) * nx + i);
+  }
+  const int added = bendCount() - before;
+  // **必须在这里重建**（而不是留给调用方）：稀疏结构与着色/关联表都是拓扑级数据。
+  // 这一条与 addShearDiagonals 完全同理 —— 2026-09-22 漏过一次，被残差的契约检查当场挡下
+  // （"vertexEdges 6240 项（期望 9282）"，表现是越界读到卡住不返回）。
+  // 本函数只在场景构造期（串行、区域外）调用，代价是一次 O(E + B) 的重建。
+  if (added > 0) buildSparsityPattern();
+  return added;
+}
+
 void Mesh::buildSparsityPattern() {
-  // 结构 = 对角块 + 每条约束引入的两个非对角块。
+  // 结构 = 对角块 + 每条约束引入的非零块。
   // 该结构只依赖拓扑，与位形、刚度无关，因此只需构建一次。
   blocks_.clear();
   const int n = vertexCount();
-  blocks_.reserve(static_cast<std::size_t>(n) + 2 * edges.size());
+  // 预留量按"上界"给：每条边 2 块、每个 stencil 最多 9 块（去重后更少）。
+  blocks_.reserve(static_cast<std::size_t>(n) + 2 * edges.size() + 9 * bends.size());
   for (int i = 0; i < n; ++i) blocks_.push_back(BlockEntry{i, i});
   for (const auto& e : edges) {
     blocks_.push_back(BlockEntry{e.a, e.b});
     blocks_.push_back(BlockEntry{e.b, e.a});
+  }
+  // 弯曲 stencil：三个顶点之间的**全部 3×3 块**（含对角，共 9 个位置；去重交给下面的
+  // sort+unique）。为什么要把对角也显式放进来 —— 对角块本来就在 blocks_ 里（上面的循环），
+  // 但重复项由 unique 去掉，所以"多放"没有代价，而"漏放"会少一次可能的耦合。
+  for (const auto& s : bends) {
+    const int v[3] = {s.a, s.b, s.c};
+    for (int p = 0; p < 3; ++p) {
+      for (int q = 0; q < 3; ++q) blocks_.push_back(BlockEntry{v[p], v[q]});
+    }
   }
   std::sort(blocks_.begin(), blocks_.end(), [](const BlockEntry& p, const BlockEntry& q) {
     return p.row != q.row ? p.row < q.row : p.col < q.col;
@@ -234,11 +273,24 @@ void Mesh::buildSparsityPattern() {
   // 本函数同时也是"拓扑变了"的入口（例如 `_verify/chain_test.cpp` 先 makeScene 拿到网格，
   // 再清空边表换成一条链），此时旧着色引用的边索引已经失效 —— 那正是会越界读的场景。
   buildConstraintColoring(*this, coloring_);
+  // 顶点→弯曲 stencil 的 CSR 同理（残差的 gather 用它当循环边界）。
+  // 没有 stencil 时它也必须被建成"vertexCount+1 个零"，所以不加 `if (!bends.empty())`。
+  buildBendAdjacency(*this, bendAdjacency_);
 }
 
 void Mesh::ensureConstraintColoring() const {
   // 幂等、O(1) 检查（看 built 而不是 colorCount：0 条边的网格也算"已构建"）。
   if (!coloring_.built) buildConstraintColoring(*this, coloring_);
+}
+
+void Mesh::ensureBendAdjacency() {
+  // 幂等、O(1) 检查（看 vertexStart 是否为空，见头文件的说明）。
+  // 实测踩过：`_verify/check.cpp` 第 8 项手工搭了一个"只有 1 条边"的 Mesh 直接
+  // 调 DistanceTerm，从没调过 buildSparsityPattern()；残差的契约检查会当场挡住
+  //（"[residual] 违反前置条件：弯曲 stencil 关联表已过期 —— vertexStart 0 项"），
+  // 而"手工搭的 Mesh 也能跑"是这个仓库的既有约定（同 ensureConstraintColoring）。
+  // 每次都是 O(B)（B = 0 时就是一次 assign）⇒ 代价可忽略。
+  if (bendAdjacency_.vertexStart.empty()) buildBendAdjacency(*this, bendAdjacency_);
 }
 
 Scalar Mesh::totalMass() const {

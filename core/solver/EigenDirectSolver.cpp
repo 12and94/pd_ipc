@@ -175,6 +175,8 @@ void EigenDirectSolver::factorize(const Eigen::SparseMatrix<Scalar>& L) {
     impl_->dinv = impl_->solver.vectorD().cwiseInverse();
     impl_->work.resize(impl_->n);
     impl_->ready = true;
+    // 因子的 nnz（诊断用：填充多大就决定了回代要读多少数据）
+    stats_.factorNnz = static_cast<long long>(impl_->factor->nonZeros());
     // 数值分解之后才知道因子结构 ⇒ 在这里做一次"能否按 x/y/z 三分量拆分"的分析
     // （一次性 O(nnz)；失败就保持 1 个分量，调用方退回整趟求解）。
     impl_->buildComponents();

@@ -158,6 +158,10 @@ target_link_libraries(pd_solveaudit PRIVATE pd_core)
 add_executable(pd_solvecomp _verify/solve_components.cpp)
 target_link_libraries(pd_solvecomp PRIVATE pd_core)
 
+# 线性（中点）弯曲约束的代数审计（左端块 / 右端常向量 / pin 覆盖 / 残差口径 / ⊗ 结构）
+add_executable(pd_bendaudit _verify/bend_audit.cpp)
+target_link_libraries(pd_bendaudit PRIVATE pd_core)
+
 # ---------------------------------------------------------------------------
 # 无窗口基准（CI 与性能基线用）
 # ---------------------------------------------------------------------------

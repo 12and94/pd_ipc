@@ -13,6 +13,8 @@
 //      **没有系数 2**（早期文档曾写 2κ_c d_c，是错的，已全局更正）。
 #pragma once
 
+#include <vector>
+
 #include <Eigen/Sparse>
 
 #include "core/energy/DistanceTerm.h"
@@ -35,11 +37,27 @@ SolverStamp computeStamp(const Mesh& mesh, Scalar dt, Scalar damping, uint64_t t
 /// 踩过一次访问违例）。
 uint64_t computeStructureStamp(const Mesh& mesh, uint64_t topologyId);
 
-/// 组装 L 的数值部分：M/h² + Σ_c κ_c A_cᵀ A_c，并覆盖 pinned 行。
+/// 组装 L 的数值部分：M/h² + Σ_c κ_c A_cᵀ A_c + Σ_s k_s·w_p w_q·I₃，并覆盖 pinned 行。
 /// 惯性项是**未缩放**的 M/h²；阻尼不进入 L（它只影响速度更新，见 Integrator.cpp 第 5 步）。
 /// 只在 stamp 变化时调用（正常运行时每帧不调用）。
+///
+/// 为什么弯曲的右端是一个**常向量**：整条 `A_c` 是常数矩阵、投影 `p_c ≡ 0`（流形是线性子空间），
+/// 所以每迭代唯一会变的那部分（散射）**根本不存在**。右端唯一多出来的项来自
+/// "stencil 里有 pinned 顶点"时的消元补偿（推导见 .cpp），而 pinned 位置是**常数**
+/// （把手不动时）⇒ 它可以在装配期一次算完，不进每迭代热路径、不需要任何额外 barrier。
 void assembleLeftHandSide(const Mesh& mesh, Scalar dt, Scalar damping,
-                          Eigen::SparseMatrix<Scalar>& L);
+                          Eigen::SparseMatrix<Scalar>& L,
+                          std::vector<Scalar>* bendingRhs = nullptr);
+
+/// 只算弯曲约束的常向量右端（尺寸 3N）。**等价于**跑一遍 assembleLeftHandSide 的右端部分，
+/// 代价只有 O(Σ_s 3)（不动矩阵、不建三元组）。
+///
+/// 为什么要单独有这个入口：`assembleLeftHandSide` 只在**数值 stamp 变化**时调用，而它的
+/// 右端部分依赖 `mesh.pinPositions` —— 拖拽把手**只改 b、不改 L**（docs/plan.md §2.2.1 的
+/// 明确约定，`stampChangesOnlyWhenLeftHandSideValuesChange` 把它钉住了）。于是"pin 位置变了
+/// 但 stamp 没变"时，早先算好的常向量就过期了。所以这个函数每子步都要跑一次（O(B)，可忽略），
+/// 而矩阵那一趟仍然只在 stamp 变化时跑。
+void assembleBendingRhs(const Mesh& mesh, std::vector<Scalar>& out);
 
 /// 组装右端的惯性部分：b = (M/h²)·x̂（**只有这一项**）。
 /// 重力**不在这里**：它只出现在预测位置 x̂ = x + hv + h²g 里（只出现一次，

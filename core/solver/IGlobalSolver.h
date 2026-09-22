@@ -120,7 +120,8 @@ class IGlobalSolver {
     double lastSolveSeconds = 0.0;
     double totalFactorizeSeconds = 0.0;
     double totalSolveSeconds = 0.0;
-    long long nnz = 0;
+    long long nnz = 0;         ///< analyze 时传入的结构矩阵的 nnz（方便核对"结构是多少"）
+    long long factorNnz = 0;   ///< 因子的 nnz（诊断：填充有多大 —— 代价全在这里）
   };
   virtual const Stats& stats() const = 0;
 };
