@@ -679,9 +679,9 @@ inline void scatterEdgeValue(const Mesh&, const Edge&, const Vec3& d, Scalar* ou
 
 | 检查 | 结果 |
 |---|---|
-| `pd_check` 8/8、**300 断言**、`pd_trans`/`pd_chain`/`pd_diraudit` | 全过 |
+| `pd_check` 8/8、**302 断言**、`pd_trans`/`pd_chain`/`pd_diraudit` | 全过 |
 | 与融合前二进制逐字比对物理输出（40×40/iters40、60×60/iters2、100×100/iters10） | **全部逐字相同** |
-| 融合路径 vs 两趟路径（`pd_solvecomp` 之外的独立回归断言） | ⬜ **待补**（见 `docs/open-issues.md` §1.2 的备注） |
+| 独立回归断言 `fusedProjectScatterMatchesSplitPath`（融合路径 == 两趟路径，`memcmp` 逐位） | ✅ 已补（`test_primitives` 130 → **132** 断言） |
 
 ---
 

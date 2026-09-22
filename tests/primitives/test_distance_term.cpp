@@ -730,4 +730,40 @@ TEST(componentPinOverwriteMatchesFullPinOverwrite) {
   CHECK_MSG(sameBits(whole, single), "components == 1 时 applyPinRhsComponent 必须等价于 applyPinRhs");
 }
 
+TEST(fusedProjectScatterMatchesSplitPath) {
+  // Phase 4d 的回归锚点：融合路径（`projectAndScatterIntoInRegion`）与两趟路径
+  // （`project` → `scatterInto`）必须**逐位相同**。
+  //
+  // 为什么这条断言重要：融合之所以是"零数值风险"，靠的是两条路**共用同一份算术 helper**
+  // （`projectEdgeValue` / `scatterEdgeValue`）。这条断言把那个结构性保证钉死 ——
+  // 将来谁把 helper 拆开、或改成不等价的写法（例如把颜色序换成边序），它会立刻变红。
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+  const std::size_t dim = static_cast<std::size_t>(3 * m.vertexCount());
+
+  std::vector<Vec3> targets;
+  DistanceTerm::project(m, targets);  // 两趟路径用的投影
+
+  // 一个非平凡的基值（右端 = base + 散射；base 不能全零，否则测试没有分辨力）
+  std::vector<Scalar> base(dim, 0.0);
+  for (std::size_t i = 0; i < dim; ++i) {
+    base[i] = 0.5 + 0.25 * static_cast<Scalar>(i % 7);
+  }
+  std::vector<Scalar> bSplit = base;
+  std::vector<Scalar> bFused = base;
+
+  DistanceTerm::scatterInto(m, targets, bSplit.data(), dim);  // 两趟路径（内部自己开区域）
+
+  // 融合路径是"区域内"函数，必须在并行区域里调用（与 stepOnce 的用法一致）。
+#ifdef _OPENMP
+#pragma omp parallel num_threads(4)
+#endif
+  {
+    DistanceTerm::projectAndScatterIntoInRegion(m, base.data(), bFused.data(), dim);
+  }
+
+  CHECK_MSG(maxAbsValue(bSplit) > 0.0, "右端不应全零，否则这个测试等于没测");
+  CHECK_MSG(std::memcmp(bSplit.data(), bFused.data(), sizeof(Scalar) * dim) == 0,
+            "融合路径与两趟路径必须逐位相同（两条路共用同一份算术 helper）");
+}
+
 TEST_MAIN("primitives/distance_term")
