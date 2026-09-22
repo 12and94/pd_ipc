@@ -91,16 +91,19 @@ void checkColoringContract(const Mesh& mesh) {
 ///   · 矩阵块：对角 +κI、耦合 -κI，只跳过"两端都 pin"的约束（assembleMatrix）
 ///   · 散射  ：b_a -= κ d_c、b_b += κ d_c（scatterEdge）
 ///   · pinned 行：由 applyPinRhs 整行覆盖（Assembler.cpp）
-inline void projectEdge(const Mesh& mesh, std::vector<Vec3>& targets, std::size_t c) {
-  const Edge& e = mesh.edges[c];
+inline Vec3 projectEdgeValue(const Mesh& mesh, const Edge& e) {
   const Vec3 raw = mesh.positions[static_cast<std::size_t>(e.a)] -
                    mesh.positions[static_cast<std::size_t>(e.b)];
   const Scalar len = length(raw);
   if (len <= DistanceTerm::kMinLength) {
-    targets[c] = Vec3{0, 0, 0};  // 退化保护：两点重合时方向未定义
-  } else {
-    targets[c] = raw * (e.restLength / len);
+    return Vec3{0, 0, 0};  // 退化保护：两点重合时方向未定义
   }
+  return raw * (e.restLength / len);
+}
+
+/// 分段两趟路径用的薄封装：把投影写进 targets。
+inline void projectEdge(const Mesh& mesh, std::vector<Vec3>& targets, std::size_t c) {
+  targets[c] = projectEdgeValue(mesh, mesh.edges[c]);
 }
 
 /// 散射的核心（一条边，累加到某个缓冲上）。
@@ -115,12 +118,11 @@ inline void projectEdge(const Mesh& mesh, std::vector<Vec3>& targets, std::size_
 /// 平移系统后行为改变（无重力、已在静止长度时都会自行变形）。
 /// 以单弹簧为例，正确的全局步是
 ///     (m/h² + κ)·x = (m/h²)·x̂ + κ·d_c + κ·q
-inline void scatterEdge(const Mesh& mesh, const std::vector<Vec3>& targets, std::size_t c, Scalar* out) {
-  const Edge& e = mesh.edges[c];
+inline void scatterEdgeValue(const Mesh& mesh, const Edge& e, const Vec3& d, Scalar* out) {
   const bool aPinned = mesh.isPinned(e.a);
   const bool bPinned = mesh.isPinned(e.b);
   if (aPinned && bPinned) return;
-  const Vec3 contribution = targets[c] * e.stiffness;
+  const Vec3 contribution = d * e.stiffness;
   const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
   const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
 
@@ -147,6 +149,13 @@ inline void scatterEdge(const Mesh& mesh, const std::vector<Vec3>& targets, std:
     out[ia + 1] += e.stiffness * q.y;
     out[ia + 2] += e.stiffness * q.z;
   }
+}
+
+/// 分段两趟路径（project 之后再 scatter）用的薄封装：从物化好的 targets 里取投影。
+/// 融合路径不走这里 —— 两条路共用上面的 `scatterEdgeValue`，这正是"逐位相同"的来源。
+inline void scatterEdge(const Mesh& mesh, const std::vector<Vec3>& targets, std::size_t c,
+                        Scalar* out) {
+  scatterEdgeValue(mesh, mesh.edges[c], targets[c], out);
 }
 
 }  // namespace
@@ -255,6 +264,43 @@ void DistanceTerm::scatterInto(const Mesh& mesh, const std::vector<Vec3>& target
   {
     // base == b ⇒ 累加到现有值，与改造前 parallel 分支的语义相同。
     scatterIntoInRegion(mesh, targets, b, b, dim);
+  }
+}
+
+void DistanceTerm::projectAndScatterIntoInRegion(const Mesh& mesh, const Scalar* base, Scalar* b,
+                                                std::size_t dim) {
+  // 与 scatterIntoInRegion 同一套契约与前置检查（各查一次，O(1)，非热路径）。
+  const bool accumulateOnly = (base == b);
+  if (threadId() == 0) {
+    checkPinContract(mesh);
+    checkColoringContract(mesh);
+  }
+
+  const ConstraintColoring& coloring = mesh.constraintColoring();
+
+  if (!accumulateOnly) {
+    // 种子趟：b = base（保留不动 —— 它只有 O(dim) 流量与 1 个 barrier，
+    // 而"把首色并进基数写"需要在每条边的热循环里判"该顶点是否首次被触碰"，
+    // 按 docs/perf.md §7.3 的教训（热循环里加一点点东西都可能被布局放大）不划算）。
+#ifdef _OPENMP
+#pragma omp for
+#endif
+    for (long long i = 0; i < static_cast<long long>(dim); ++i) b[i] = base[i];
+  }
+
+  // 逐色融合：同色内的边两两不共享顶点 ⇒ 就地算投影、直接累加**没有任何冲突**。
+  // 求和顺序与两趟版本完全一致（颜色序；同色内每个顶点最多被写一次）⇒ 结果逐位相同。
+  for (int c = 0; c < coloring.colorCount; ++c) {
+    const long long begin = static_cast<long long>(coloring.begin(c));
+    const long long end = static_cast<long long>(coloring.end(c));
+    if (begin == end) continue;  // 空色类：不浪费一次 barrier
+#ifdef _OPENMP
+#pragma omp for
+#endif
+    for (long long k = begin; k < end; ++k) {
+      const Edge& e = mesh.edges[coloring.order[static_cast<std::size_t>(k)]];
+      scatterEdgeValue(mesh, e, projectEdgeValue(mesh, e), b);
+    }
   }
 }
 

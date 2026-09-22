@@ -371,17 +371,14 @@ int stepOnce(SimContext& ctx) {
     // 4) PD 迭代：局部步 → 散射 → 覆盖 pin → 全局步 → 判据（循环留在区域内）
     // ---------------------------------------------------------------
     for (int k = 0; k < cfg.maxIterations; ++k) {
-      // 4b) 局部步：逐约束独立闭式投影（逐边写 targets[c]，无跨线程依赖）
+      // 4b+4c) 融合的"投影 + 散射"（2026-09-22）：按颜色就地算 d_c 并直接累加到右端，
+      //    不再物化 targets 中间量（省掉它的写+读，以及两个端点位置的一次重复读取）。
+      //    语义与原来"projectInRegion 之后再 scatterIntoInRegion"等价，且两条路共用同一份
+      //    算术 helper ⇒ 结果**逐位相同**（见 DistanceTerm.h）。桶归属：并入"散射"桶
+      //    （"局部步"不再是独立阶段，这一趟 = 原来的局部步 + 散射）。
       {
         const auto t0 = Clock::now();
-        DistanceTerm::projectInRegion(m, ctx.targets);
-        if (threadId() == 0) ctx.times.localStep += secondsSince(t0);
-      }
-
-      // 4c) 右端 = 基值 + 约束散射（融合：省掉整次 `b = bBase` 的 O(3N) 拷贝）
-      {
-        const auto t0 = Clock::now();
-        DistanceTerm::scatterIntoInRegion(m, ctx.targets, ctx.bBase.data(), ctx.b.data(), dim);
+        DistanceTerm::projectAndScatterIntoInRegion(m, ctx.bBase.data(), ctx.b.data(), dim);
         if (threadId() == 0) ctx.times.scatter += secondsSince(t0);
       }
 

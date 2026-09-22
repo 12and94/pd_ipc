@@ -82,6 +82,16 @@ class DistanceTerm {
   /// （独立入口 `scatterInto` 复用这条实现时用）。
   static void scatterIntoInRegion(const Mesh& mesh, const std::vector<Vec3>& targets,
                                   const Scalar* base, Scalar* b, std::size_t dim);
+
+  /// **融合的"投影 + 散射"**（2026-09-22 新增）：按颜色就地算 d_c 并直接累加到两端点，
+  /// 不再物化 `targets` 中间量。语义与"`projectInRegion` 之后再 `scatterIntoInRegion`"等价，
+  /// 而且每一步算术都走同一份 helper（`projectEdgeValue` / `scatterEdgeValue`）
+  /// ⇒ 结果**逐位相同**（每个顶点的累加顺序仍是颜色序，同色内每个顶点最多被写一次）。
+  ///
+  /// 省的账（40×40，每迭代）：`targets` 的写 + 读各 3120×24 B ≈ 75 KB、两个端点位置少读一遍。
+  /// 与 `scatterIntoInRegion` 一样，**必须在并行区域内**调用（内部是 `omp for`）。
+  static void projectAndScatterIntoInRegion(const Mesh& mesh, const Scalar* base, Scalar* b,
+                                            std::size_t dim);
 };
 
 }  // namespace pd

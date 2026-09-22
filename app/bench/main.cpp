@@ -178,8 +178,11 @@ int main(int argc, char** argv) {
   std::printf("\n--- 阶段耗时（累计 ms，占比）---\n");
   auto pct = [&](double v) { return wall > 0.0 ? 100.0 * v / wall : 0.0; };
   std::printf("  预测      %10.3f  %5.1f%%\n", t.predict * 1e3, pct(t.predict));
-  std::printf("  局部步    %10.3f  %5.1f%%\n", t.localStep * 1e3, pct(t.localStep));
-  std::printf("  散射      %10.3f  %5.1f%%\n", t.scatter * 1e3, pct(t.scatter));
+  // 2026-09-22：投影与散射已融合成一趟（不再物化 targets）⇒ 这两桶合并显示。
+  // 老日志里它们是分开的（"局部步" + "散射"），比较历史数字时要把两者相加。
+  const double projScatter = t.localStep + t.scatter;
+  std::printf("  投影+散射 %10.3f  %5.1f%%  （融合的一趟；历史日志里拆成『局部步』+『散射』）\n",
+              projScatter * 1e3, pct(projScatter));
   std::printf("  组装+分解 %10.3f  %5.1f%%  （只应在 stamp 变化时发生）\n", t.assemble * 1e3,
               pct(t.assemble));
   std::printf("  全局回代  %10.3f  %5.1f%%\n", t.solve * 1e3, pct(t.solve));
