@@ -3,7 +3,8 @@
 首期目标：**纯 CPU 的 Projective Dynamics 布料仿真器**，只含**距离约束 + pin**，跑通完整时间步并带渲染。
 规划见 `docs/plan.md`，环境记录见 `docs/environment.md`，开发规范见 `docs/contributing.md`，
 代码与命令索引见 `docs/code-map.md`，**收敛成因与刚度标定见 `docs/pd-convergence.md`**，
-**并行改造方案见 `docs/parallel-refactor.md`，性能记录见 `docs/perf.md`**。
+**并行改造方案见 `docs/parallel-refactor.md`，性能记录见 `docs/perf.md`**，
+**现存问题与优化机会（工作清单）见 `docs/open-issues.md`**。
 
 **当前状态**：整条链路（预测 → PD 迭代 → 全局求解 → 速度更新）已完整跑通，
 `pd_check` 8 项验收全通过，三个测试套件 300 个断言全通过，实时渲染可用。

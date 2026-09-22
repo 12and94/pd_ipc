@@ -3,7 +3,8 @@
 > 本文档只讲两件事：**每部分代码在哪**、**怎么运行并看结果**。
 > 计划与设计见 `docs/plan.md`，进度与现象记录见 `README.md`，
 > **收敛问题的成因与刚度标定见 `docs/pd-convergence.md`**，
-> **并行改造方案见 `docs/parallel-refactor.md`（Phase 1 已实施）、性能记录见 `docs/perf.md`**。
+> **并行改造方案见 `docs/parallel-refactor.md`（Phase 1 已实施）、性能记录见 `docs/perf.md`**，
+> **现存问题与优化机会见 `docs/open-issues.md`**。
 
 ---
 
@@ -101,7 +102,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
 | `core/assemble/Assembler.h/.cpp` | `computeStamp()`（判定何时需要重新分解：拓扑/刚度/质量/h/pin/阻尼）、`assembleLeftHandSide()`（$M/h^2+\sum\kappa A^\top A$ + pinned 行覆盖）、`assembleInertialRhs()`（右端 $(M/h^2)\hat x$，**重力不在这里**）、`applyPinRhs()`（pinned 行右端置为把手位置）、`pack/unpackPositions` | 3、7 |
-| `core/solver/IGlobalSolver.h` | 求解器抽象：`analyze` / `factorize` / `solve` 三段 + `SolverStamp`。三条路线的差异都收在这里 | 7 |
+| `core/solver/IGlobalSolver.h` | 求解器抽象：`analyze` / `factorize` / `solve` 三段 + `SolverStamp`；另有 **`parallelComponents()` / `solveComponent(c,b,x)`**（2026-09-22 起：`L = Ã ⊗ I₃` ⇒ 全局步可按 x/y/z 拆成 3 条零同步的独立链；结构不满足时返回 1 自动退回整趟）。三条路线的差异都收在这里 | 7 |
 | `core/solver/EigenDirectSolver.h/.cpp` | `Eigen::SimplicialLDLT` 实现；符号分解用**真实矩阵结构**（不能用理想块模式，否则 solve 阶段会访问越界）。<br>**2026-09-22 起 `solve` 由本文件自己实现**（前代 scatter 形式 + 预存 1/D + 回代直接扫 CSC 列），排序也由它自己调 AMD（`Eigen::AMDOrdering`）以便拿到置换：实测比 `SimplicialLDLT::solve()` 快 10–20 %（回代占单子步 76 %），且**数值与之逐位相同**。原因与踩过的坑见 `docs/perf.md` §8 | 7 |
 | `core/solver/SparsePattern.h` | `BlockEntry`（3×3 非零块的位置） | — |
 
@@ -110,7 +111,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
 | `core/sim/Integrator.h` | `stepOnce` / `stepFrame` / `surrogateEnergy` / `totalEnergy` / `maxSpeed` | 2、3、5、6 |
-| `core/sim/Integrator.cpp` | `stepOnce()` 的流程（**Phase 1 之后：一个子步只进入一个并行区域**，见 `docs/parallel-refactor.md` §4.1），按阶段编号：<br>**1) 判定+数值分解**（区域外，串行）——只在 stamp 变化时执行<br>**2) 预测** $\hat x=x+hv+h^2g$（区域内的 `omp for`；**融合**了"保存上一步位置"与"初始化 previous"）——**重力只在这里出现一次**<br>**3) 惯性右端** $b_{\text{base}}=(M/h^2)\hat x$（`omp single`）<br>**4) PD 迭代**：局部步(`projectInRegion`) → 散射(`scatterIntoInRegion`，融合了基值) → 覆盖 pin+全局回代（同一个 `single`） → 解包+收敛扫描+previous+**非线性残差**（融合成一趟，`omp for nowait` + 每线程部分最大值；**Phase 3 之后残差是逐顶点 gather，不再是串行趟**，见 `docs/perf.md` §7） → 判据（`omp single`，只做合并与判定）<br>**5) 速度更新与阻尼**（`omp for nowait`） | 2、3、5、6 |
+| `core/sim/Integrator.cpp` | `stepOnce()` 的流程（**Phase 1 之后：一个子步只进入一个并行区域**，见 `docs/parallel-refactor.md` §4.1），按阶段编号：<br>**1) 判定+数值分解**（区域外，串行）——只在 stamp 变化时执行<br>**2) 预测** $\hat x=x+hv+h^2g$（区域内的 `omp for`；**融合**了"保存上一步位置"与"初始化 previous"）——**重力只在这里出现一次**<br>**3) 惯性右端** $b_{\text{base}}=(M/h^2)\hat x$（`omp single`）<br>**4) PD 迭代**：局部步(`projectInRegion`) → 散射(`scatterIntoInRegion`，融合了基值) → 覆盖 pin+全局回代（同一个 **`omp for`，按 x/y/z 三分量并行**，Phase 4c；`single` 时是整趟） → 解包+收敛扫描+previous+**非线性残差**（融合成一趟，`omp for nowait` + 每线程部分最大值；**Phase 3 之后残差是逐顶点 gather，不再是串行趟**，见 `docs/perf.md` §7） → 判据（`omp single`，只做合并与判定）<br>**5) 速度更新与阻尼**（`omp for nowait`） | 2、3、5、6 |
 
 > **说明**：目前形式是 $v_{n+1}=(1-k_d)(x_{n+1}-x_n)/h$。
 > 重力只通过第 1 阶段的 $\hat x=x+hv+h^2g$ 进入，右端**不需要**再补外力项
