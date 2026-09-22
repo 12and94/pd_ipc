@@ -268,7 +268,6 @@ void EigenDirectSolver::solveComponent(int c, const Eigen::VectorXd& b, Eigen::V
     return;
   }
 
-  const auto t0 = Clock::now();
   const int n = impl_->n;
   const char* kPre = "[EigenDirectSolver::solveComponent] 违反前置条件";
 
@@ -332,14 +331,17 @@ void EigenDirectSolver::solveComponent(int c, const Eigen::VectorXd& b, Eigen::V
   }
   for (int k : ac) x[o[k]] = w[k];  // x = P⁻¹·y（只写本分量）
 
-  // 统计口径：`solveCalls` 只在分量 0 的那次调用上自增 ⇒ 仍然等于"全局步次数"，
-  // 与改动前（每次 solve 一次）以及 tests/bench 的口径一致。
-  // `totalSolveSeconds` 累加每个分量自己的耗时 ⇒ 仍近似等于"整趟串行的工作量"，
-  // 因此"累计回代耗时 / 回代次数"这个比值仍与历史可比。
-  // 注意 `lastSolveSeconds` 在拆分时是**单个分量的切片**（约为整趟的 1/3）。
-  if (c == 0) stats_.solveCalls += 1;
-  stats_.lastSolveSeconds = secondsSince(t0);
-  stats_.totalSolveSeconds += stats_.lastSolveSeconds;
+  // **这里刻意不碰 stats_**：本函数会被多条线程并发调用，而 `stats_` 的累加不是原子的
+  // （2026-09-22 本轮曾写成 `totalSolveSeconds += ...`，那是一个数据竞争 = UB）。
+  // 记账改由调用方在阶段 barrier 之后**单线程**调用 noteSolveStage() 完成，见 IGlobalSolver.h。
+}
+
+void EigenDirectSolver::noteSolveStage(double seconds) {
+  // components == 1 时整趟路径由 solve() 自己记账，这里无操作（否则重复计数）。
+  if (impl_->components <= 1) return;
+  stats_.solveCalls += 1;
+  stats_.lastSolveSeconds = seconds;
+  stats_.totalSolveSeconds += seconds;
 }
 
 }  // namespace pd

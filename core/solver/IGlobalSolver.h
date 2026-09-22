@@ -96,6 +96,20 @@ class IGlobalSolver {
     solve(b, x);
   }
 
+  /// 记一次"全局步阶段"的耗时（秒）。
+  ///
+  /// **为什么需要它**：拆成多条线程之后，`solveComponent()` 会被并发调用，
+  /// 如果让它自己 `stats_.totalSolveSeconds += ...`，那就是多线程非原子读-改-写
+  /// （数据竞争，C++ 层面是 UB —— 2026-09-22 本轮真的这么写错过了，现已改掉）。
+  /// 所以约定：**调用方在 `parallelComponents() > 1` 时，于该阶段的 barrier 之后
+  /// 由单线程调用一次本函数**，把整个阶段的墙钟交给求解器记账。
+  /// · `parallelComponents() == 1` 时本函数应为无操作（那条路上 `solve()` 自己已经记过，
+  ///   不做这个判断就会重复计数）；
+  /// · 默认实现是无操作，其它后端可以只依赖 `solve()` 自己的记账。
+  /// 记账后 `Stats::totalSolveSeconds` 的语义是**阶段墙钟的累计**（拆分时即"每个全局步的
+  /// 求解阶段用时之和"，与 `StageTimes::solve` 同口径），不再是"各分量工作量之和"。
+  virtual void noteSolveStage(double seconds) { (void)seconds; }
+
   /// 诊断：符号分解 / 数值分解 / 回代的累计次数与最近一次耗时（秒）。
   struct Stats {
     int analyzeCalls = 0;

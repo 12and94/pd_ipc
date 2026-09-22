@@ -199,9 +199,9 @@ int main(int argc, char** argv) {
   std::printf("  符号分解耗时 %.3f ms\n", st.lastAnalyzeSeconds * 1e3);
   std::printf("  单次数值分解 %.3f ms（累计 %.3f ms）\n", st.lastFactorizeSeconds * 1e3,
               st.totalFactorizeSeconds * 1e3);
-  // 单次回代用"累计 / 次数"而不是 lastSolveSeconds：全局步现在按 x/y/z 三个分量并行
-  // （docs/perf.md §9），lastSolveSeconds 会退化成"某一个分量的切片"（约 1/3）。
-  // 累计值仍是各分量耗时之和 ⇒ 与历史同口径（都是"整趟的工作量"）。
+  // 单次回代用"累计 / 次数"。拆分求解时 `totalSolveSeconds` 是**求解阶段的墙钟累计**
+  // （由 Integrator 在 barrier 之后单线程记入，避免并发累加 stats_），
+  // 因此这一行就等于"每个全局步的求解阶段用时"，与阶段表里的 `全局回代 / 迭代数` 一致。
   std::printf("  单次回代 %.3f ms（累计 %.3f ms）\n",
               st.totalSolveSeconds / std::max(1, st.solveCalls) * 1e3,
               st.totalSolveSeconds * 1e3);

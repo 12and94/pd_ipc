@@ -40,6 +40,7 @@ class EigenDirectSolver final : public IGlobalSolver {
   void solve(const Eigen::VectorXd& b, Eigen::VectorXd& x) override;
   int parallelComponents() const override;
   void solveComponent(int c, const Eigen::VectorXd& b, Eigen::VectorXd& x) override;
+  void noteSolveStage(double seconds) override;
   const Stats& stats() const override { return stats_; }
 
   /// 是否已完成符号分解。

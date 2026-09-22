@@ -408,7 +408,13 @@ int stepOnce(SimContext& ctx) {
         // 计时口径随构造一起变了（**引用本桶数字时必须留意**）：
         //   原来 = 唯一执行者自己的执行时间（不含 barrier 等待）；
         //   现在 = 本阶段的**墙钟**（含等最慢的那条线程），与散射/解包桶口径一致。
-        if (threadId() == 0) ctx.times.solve += secondsSince(t0);
+        // 记账在 barrier 之后由**单线程**完成：求解器的 stats_ 不能由并发的分量线程累加
+        // （那是数据竞争），所以走 noteSolveStage()，见 IGlobalSolver.h 的说明。
+        if (threadId() == 0) {
+          const double stageSeconds = secondsSince(t0);
+          ctx.times.solve += stageSeconds;
+          ctx.solver->noteSolveStage(stageSeconds);
+        }
       }
 
       // 4f) 解包 + 收敛扫描 + previous 更新 + **非线性残差**（逐顶点融合成一趟）
