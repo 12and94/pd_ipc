@@ -66,9 +66,9 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 | 文件 | 内容 | 相关验收 |
 |---|---|---|
-| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、**弯曲 stencil 表**（`BendStencil` / `bends` / `addBendingStencils`）、稀疏结构 `buildSparsityPattern()`、**约束着色与顶点关联表**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
+| `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、**弯曲 stencil 表**（`BendStencil` / `bends` / `addBendingStencils`）、**弯曲采样开关**（`BendSampling` / `BendGenOptions`：全采样默认，另有单向 / 棋盘 / 隔行 —— 实测结论见 `docs/perf.md` §13）、稀疏结构 `buildSparsityPattern()`、**约束着色与顶点关联表**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
 | `core/mesh/ConstraintColoring.h/.cpp` | 约束（边）的图着色：同色边两两不共享顶点 —— 散射据此按颜色分组执行，**无需归约/原子加**。并行 Jones–Plassmann（优先级哈希 + 最小可用颜色），颜色数 ≤ Δ+1，同色内按顶点序排列（避免假共享）。**拓扑级数据**，随 `buildSparsityPattern()` 构建。<br>**另有 `BendAdjacency`**（顶点→弯曲 stencil 的 CSR，带 `w_v ∈ {1,-2,1}`）与 `buildBendAdjacency()`：弯曲没有散射，这张表**只给残差**用（每个顶点独立算自己那份弯曲力），同样随 `buildSparsityPattern()` 构建 | 散射的正确性与性能；残差口径 |
-| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差 / **`shearStiffness` / `bendStiffness`：两个可选约束，默认 0 = 关闭**）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + **`bendRhs`** + 阶段耗时）、`StageTimes` | — |
+| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差 / **`shearStiffness` / `bendStiffness`：两个可选约束，默认 0 = 关闭** / **`bendSampling` / `bendStride`：弯曲 stencil 的采样开关，默认全采样**）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + **`bendRhs`** + 阶段耗时）、`StageTimes` | — |
 | `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()` | 6、7 |
 
 > **`pinPositions` 契约（踩过坑）**：一旦 `mesh.pinned` 里有 1，`pinPositions` 就必须按顶点数填好，

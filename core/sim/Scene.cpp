@@ -1,14 +1,39 @@
 // core/sim/Scene.cpp
 #include "core/sim/Scene.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include "core/assemble/Assembler.h"
 #include "core/solver/EigenDirectSolver.h"
 
 namespace pd {
+namespace {
+
+/// 把 `PD_BEND_SAMPLING` 的取值解析成 `BendSampling`：接受 `standard` / `rows` / `cols` /
+/// `checker`（大小写不敏感，也接受 `row`/`col`、`hv`/`h`/`v`/`checkerboard` 这几种写法）。
+/// 无法识别时返回 `false`，调用方保留 `SceneConfig` 里的值（**不静默改成别的采样**）。
+bool parseBendSampling(const char* text, BendSampling& out) {
+  std::string s(text);
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (s == "standard" || s == "std" || s == "hv" || s == "both") {
+    out = BendSampling::Standard;
+  } else if (s == "rows" || s == "row" || s == "h") {
+    out = BendSampling::RowsOnly;
+  } else if (s == "cols" || s == "col" || s == "v") {
+    out = BendSampling::ColsOnly;
+  } else if (s == "checker" || s == "checkerboard" || s == "alt") {
+    out = BendSampling::Checkerboard;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
 
 SimContext makeScene(const SceneConfig& config) {
   SimContext ctx;
@@ -84,10 +109,42 @@ SimContext makeScene(const SceneConfig& config) {
       const double v = std::atof(env);
       if (v > 0.0) bend = static_cast<Scalar>(v);
     }
+    // 采样形状：`PD_BEND_SAMPLING` / `PD_BEND_STRIDE` 覆盖 `SceneConfig` 的同名字段。
+    // 这两个开关只对"降本变体"的对照实验有意义（见 docs/perf.md §13），默认值 = 今天的行为。
+    // 认不出的取值只打一行警告、保留原值 —— 免得对照实验因为打错字而**悄悄**跑成另一种配置。
+    BendGenOptions bendOpt;
+    bendOpt.sampling = config.bendSampling;
+    bendOpt.stride = config.bendStride;
+    if (const char* env = std::getenv("PD_BEND_SAMPLING")) {
+      if (!parseBendSampling(env, bendOpt.sampling)) {
+        std::printf("[scene] 警告：PD_BEND_SAMPLING=%s 无法识别（可选 standard/rows/cols/checker），"
+                    "沿用 %s\n",
+                    env, bendSamplingName(bendOpt.sampling));
+      }
+    }
+    if (const char* env = std::getenv("PD_BEND_STRIDE")) {
+      const int v = std::atoi(env);
+      if (v >= 1) {
+        bendOpt.stride = v;
+      } else {
+        std::printf("[scene] 警告：PD_BEND_STRIDE=%s 非法（需 >= 1），沿用 %d\n", env,
+                    bendOpt.stride);
+      }
+    }
     if (bend > 0.0 && config.meshPath.empty()) {
-      const int added = ctx.mesh.addBendingStencils(config.gridNx, config.gridNy, bend);
-      std::printf("[scene] 弯曲约束：新增 stencil %d 条（刚度 %g）\n", added,
-                  static_cast<double>(bend));
+      const int added =
+          ctx.mesh.addBendingStencils(config.gridNx, config.gridNy, bend, bendOpt);
+      std::printf("[scene] 弯曲约束：新增 stencil %d 条（刚度 %g，采样 %s，步长 %d）\n", added,
+                  static_cast<double>(bend), bendSamplingName(bendOpt.sampling), bendOpt.stride);
+      // 步长 >= 2 是**已实测否掉**的配置：没被采样的中心顶点可以吸收全部曲率，
+      // 于是约束集对粗尺度弯曲几乎没有阻抗 —— 代价照付（填充照样涨），物理上却近似
+      // 等于没开弯曲（k 加 100 倍、应变只变 0.4 %）。见 docs/perf.md §13。
+      // 这里只警告不改行为：万一有人就是要拿它做对照实验，得让他看得见自己在干什么。
+      if (bendOpt.stride >= 2) {
+        std::printf("[scene] 警告：弯曲采样步长 %d >= 2 —— 实测该配置对弯曲几乎无效（未采样中心"
+                    "可自由吸收曲率，见 docs/perf.md §13），代价却照付；建议步长 1。\n",
+                    bendOpt.stride);
+      }
     }
   }
 

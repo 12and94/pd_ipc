@@ -206,10 +206,24 @@ int Mesh::addShearDiagonals(int nx, int ny, Scalar stiffness) {
   return added;
 }
 
-int Mesh::addBendingStencils(int nx, int ny, Scalar stiffness) {
+const char* bendSamplingName(BendSampling s) {
+  switch (s) {
+    case BendSampling::Standard: return "standard";
+    case BendSampling::RowsOnly: return "rows";
+    case BendSampling::ColsOnly: return "cols";
+    case BendSampling::Checkerboard: return "checker";
+  }
+  return "?";
+}
+
+int Mesh::addBendingStencils(int nx, int ny, Scalar stiffness, const BendGenOptions& opt) {
   if (nx < 3 && ny < 3) return 0;  // 两个方向都放不下"三个连续顶点"（单方向容得下时另一个方向自然为 0 条）
   if (vertexCount() != nx * ny) return 0;  // 只对规则网格有意义
   const int before = bendCount();
+  const int stride = opt.stride > 0 ? opt.stride : 1;
+  const bool checker = opt.sampling == BendSampling::Checkerboard;
+  const bool rows = opt.sampling == BendSampling::Standard || opt.sampling == BendSampling::RowsOnly;
+  const bool cols = opt.sampling == BendSampling::Standard || opt.sampling == BendSampling::ColsOnly;
   auto add = [&](int a, int b, int c) {
     BendStencil s;
     s.a = a;
@@ -218,13 +232,48 @@ int Mesh::addBendingStencils(int nx, int ny, Scalar stiffness) {
     s.stiffness = stiffness;
     bends.push_back(s);
   };
+  // 生成顺序对 standard/stride=1 **必须保持原样**（先行后列、i/j 升序）：残差与关联表
+  // 的逐位可复现性依赖"按 stencil 号升序"的累加次序（见 ConstraintColoring.cpp 的说明），
+  // 历史基线也依赖这个次序。
+  //
   // 行方向：固定 j，i = 1..nx-2。索引约定 v = j*nx + i（与 makeGrid 一致）。
-  for (int j = 0; j < ny; ++j) {
-    for (int i = 1; i + 1 < nx; ++i) add(j * nx + i - 1, j * nx + i, j * nx + i + 1);
+  if (rows) {
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 1; i + 1 < nx; ++i) {
+        if ((i - 1) % stride != 0) continue;  // 隔行采样：只保留中心顶点 i = 1, 1+s, 1+2s, ...
+        add(j * nx + i - 1, j * nx + i, j * nx + i + 1);
+      }
+    }
   }
   // 列方向：固定 i，j = 1..ny-2。
-  for (int i = 0; i < nx; ++i) {
-    for (int j = 1; j + 1 < ny; ++j) add((j - 1) * nx + i, j * nx + i, (j + 1) * nx + i);
+  if (cols) {
+    for (int i = 0; i < nx; ++i) {
+      for (int j = 1; j + 1 < ny; ++j) {
+        if ((j - 1) % stride != 0) continue;
+        add((j - 1) * nx + i, j * nx + i, (j + 1) * nx + i);
+      }
+    }
+  }
+  // 棋盘交替：**每个中心顶点只在行/列里取一个方向** —— `(i+j)` 为偶 ⇒ 取行、为奇 ⇒ 取列。
+  // 所以总数仍是"标准"的一半（各方向覆盖一半的中心），但两个方向都还在、且分布均匀，
+  // 这比"只取单向"的各向异性小（见 docs/perf.md §13 的实测）。
+  // 注意这里**不能**复用上面的 rows/cols 两个循环：那两个循环是"全部中心都取该方向"，
+  // 用奇偶过滤会让每个偶和对的中心同时拿到行+列、奇和对的中心什么都拿不到 —— 分布不均。
+  if (checker) {
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 1; i + 1 < nx; ++i) {
+        if ((i - 1) % stride != 0) continue;
+        if (((i + j) & 1) != 0) continue;
+        add(j * nx + i - 1, j * nx + i, j * nx + i + 1);
+      }
+    }
+    for (int i = 0; i < nx; ++i) {
+      for (int j = 1; j + 1 < ny; ++j) {
+        if ((j - 1) % stride != 0) continue;
+        if (((i + j) & 1) == 0) continue;
+        add((j - 1) * nx + i, j * nx + i, (j + 1) * nx + i);
+      }
+    }
   }
   const int added = bendCount() - before;
   // **必须在这里重建**（而不是留给调用方）：稀疏结构与着色/关联表都是拓扑级数据。

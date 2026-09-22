@@ -1073,4 +1073,280 @@ TEST(bendingLeftHandSideIsConfigurationIndependent) {
             "弯曲力必须随刚度单调变强，且方向始终朝 -y（回复力）");
 }
 
+// ---------------------------------------------------------------------------
+// 10) 弯曲 stencil 的采样变体（降本开关）：单向 / 隔行 / 棋盘
+//
+// 动机：弯曲的代价几乎全在**消元填充**上（因子 nnz 2.77×），而填充由"每个未知量被多少
+// 约束耦合"决定 ⇒ 减少 stencil 数量是直接打在填充上的降本手段（docs/perf.md §13）。
+// 本节钉的是"变体没有偷偷改变结构性质"：
+//   · 默认选项必须与不传选项**逐条相同**（默认路径逐位不变，历史基线才算数）；
+//   · 各变体生成的 stencil 仍然**只有连续三个顶点的形状**（不会退化成别的约束）；
+//   · 隔行采样是完整采样的**严格子集**（不是重排、不是新增）；
+//   · 棋盘里每个中心顶点**恰好出现一次**，方向严格按 `(i+j)` 的奇偶；
+//   · 最重要的一条：**每个 3×3 块仍是 标量 × I₃** ⇒ `L = Ã ⊗ I₃` 与 Phase 4c 的
+//     三分量并行回代对这些变体同样成立（这不是"文档承诺"，这里逐块验）。
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 方向判定：行 stencil 的三个顶点同行且依次相差 1；列 stencil 依次相差 nx。
+/// 返回 0 = 行、1 = 列、-1 = 两者都不是（这种形状不该出现）。
+int bendDirectionKind(const BendStencil& s, int nx) {
+  const bool row = (s.b - s.a == 1) && (s.c - s.b == 1);
+  const bool col = (s.b - s.a == nx) && (s.c - s.b == nx);
+  if (row && !col) return 0;
+  if (col && !row) return 1;
+  return -1;
+}
+
+/// 稀疏结构里"每个块是 标量 × I₃"的逐块自检（即 `L = Ã ⊗ I₃`）。
+bool allBlocksAreScalarTimesIdentity(const Mesh& m, const Eigen::SparseMatrix<Scalar>& L) {
+  for (const BlockEntry& e : m.blockPattern()) {
+    const int r = 3 * e.row;
+    const int c = 3 * e.col;
+    const Scalar d0 = L.coeff(r + 0, c + 0);
+    const Scalar d1 = L.coeff(r + 1, c + 1);
+    const Scalar d2 = L.coeff(r + 2, c + 2);
+    if (d0 != d1 || d1 != d2) return false;
+    for (int u = 0; u < 3; ++u) {
+      for (int v = 0; v < 3; ++v) {
+        if (u != v && L.coeff(r + u, c + v) != 0.0) return false;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST(bendingSamplingVariantsAreExactSubsetsAndKeepTensorStructure) {
+  const int nx = 20;
+  const int ny = 14;
+  const Scalar spacing = 0.05;
+  const Scalar k = 777.0;
+
+  // ---- ① 默认选项 == 不传选项：逐条、按序相同（默认路径逐位不变）----
+  Mesh plain = Mesh::makeGrid(nx, ny, spacing);
+  plain.addBendingStencils(nx, ny, k);
+  Mesh dflt = Mesh::makeGrid(nx, ny, spacing);
+  dflt.addBendingStencils(nx, ny, k, BendGenOptions{});
+  CHECK_MSG(plain.bendCount() == dflt.bendCount(),
+            "不传选项与传默认 BendGenOptions 的 stencil 数必须相同");
+  bool identicalOrder = (plain.bendCount() == dflt.bendCount());
+  for (int i = 0; i < plain.bendCount() && identicalOrder; ++i) {
+    const BendStencil& p = plain.bends[static_cast<std::size_t>(i)];
+    const BendStencil& q = dflt.bends[static_cast<std::size_t>(i)];
+    if (p.a != q.a || p.b != q.b || p.c != q.c || p.stiffness != q.stiffness) {
+      identicalOrder = false;
+    }
+  }
+  CHECK_MSG(identicalOrder,
+            "默认选项必须与不传选项**按序逐条相同**（生成次序是残差逐位可复现的前提）");
+
+  // ---- ② 单向：只有该方向的 stencil，数量可解析，端点仍不生成 ----
+  const int rowOnlyExpected = (nx - 2) * ny;
+  const int colOnlyExpected = (ny - 2) * nx;
+  for (int variant = 0; variant < 2; ++variant) {
+    const bool wantRow = (variant == 0);
+    const BendSampling sampling = wantRow ? BendSampling::RowsOnly : BendSampling::ColsOnly;
+    Mesh m = Mesh::makeGrid(nx, ny, spacing);
+    const int added = m.addBendingStencils(nx, ny, k, BendGenOptions{sampling, 1});
+    const int expect = wantRow ? rowOnlyExpected : colOnlyExpected;
+    CHECK_MSG(added == expect, std::string(wantRow ? "只取行" : "只取列") +
+                                   "方向的 stencil 数应为 " + std::to_string(expect) + "，实际 " +
+                                   std::to_string(added));
+    bool dirOk = true;
+    bool boundaryOk = true;
+    for (const BendStencil& s : m.bends) {
+      const int kind = bendDirectionKind(s, nx);
+      if (kind != (wantRow ? 0 : 1)) dirOk = false;
+      const int i = s.b % nx;
+      const int j = s.b / nx;
+      // 端点不生成：约束的是**沿 stencil 方向**的那个索引 —— 行 stencil 要求 i 是内点
+      //（中心差分需要左右邻居），但它落在 j=0 / ny-1 那一行是**合法**的：那条曲率只沿 i。
+      // 所以"自由端边界"是逐方向成立的，不是"必须两个索引都是内点"。
+      if (wantRow ? (i < 1 || i > nx - 2) : (j < 1 || j > ny - 2)) boundaryOk = false;
+      if (s.stiffness != k) dirOk = false;
+    }
+    CHECK_MSG(dirOk, "单向变体必须只生成该方向的 stencil（形状 = 连续三个顶点，刚度原样传递）");
+    CHECK_MSG(boundaryOk, "单向变体仍不得在端点生成 stencil（自由端边界不因降本而改变）");
+    // 拓扑级数据必须被自动重建（漏了会越界读）
+    CHECK(m.bendAdjacency().vertexStencils.size() ==
+          static_cast<std::size_t>(m.bendCount()) * 3);
+  }
+
+  // ---- ③ 隔行采样是完整采样的严格子集（步长 2、步长 3 都是）----
+  auto triples = [](const Mesh& m) {
+    std::vector<std::array<int, 3>> out;
+    for (const BendStencil& s : m.bends) out.push_back({s.a, s.b, s.c});
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  const std::vector<std::array<int, 3>> full = triples(plain);
+  for (int stride = 2; stride <= 3; ++stride) {
+    Mesh sub = Mesh::makeGrid(nx, ny, spacing);
+    const int added = sub.addBendingStencils(nx, ny, k, BendGenOptions{BendSampling::Standard, stride});
+    const int perRow = (nx - 2 + stride - 1) / stride;  // ceil((nx-2)/stride)
+    const int perCol = (ny - 2 + stride - 1) / stride;
+    const int expect = perRow * ny + perCol * nx;
+    CHECK_MSG(added == expect, "步长 " + std::to_string(stride) + " 的 stencil 数应为 " +
+                                   std::to_string(expect) + "，实际 " + std::to_string(added));
+    const std::vector<std::array<int, 3>> got = triples(sub);
+    bool isSubset = std::includes(full.begin(), full.end(), got.begin(), got.end());
+    CHECK_MSG(isSubset, "步长 " + std::to_string(stride) +
+                            " 的结果必须是完整采样的**严格子集**（只是少取，不是重排/新增）");
+    std::vector<std::array<int, 3>> uniq = got;
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    CHECK_MSG(uniq.size() == got.size(), "隔行采样不得产生重复 stencil（重复会双倍加刚度）");
+  }
+
+  // ---- ④ 棋盘：每个中心顶点恰好一次，方向严格按 (i+j) 的奇偶 ----
+  {
+    Mesh m = Mesh::makeGrid(nx, ny, spacing);
+    const int added = m.addBendingStencils(nx, ny, k, BendGenOptions{BendSampling::Checkerboard, 1});
+    CHECK(added == m.bendCount());
+    CHECK(added > 0);
+
+    std::vector<int> centerHits(static_cast<std::size_t>(m.vertexCount()), 0);
+    bool parityOk = true;
+    for (const BendStencil& s : m.bends) {
+      const int i = s.b % nx;
+      const int j = s.b / nx;
+      const int kind = bendDirectionKind(s, nx);
+      centerHits[static_cast<std::size_t>(s.b)] += 1;
+      const bool even = ((i + j) % 2) == 0;
+      if (even ? (kind != 0) : (kind != 1)) parityOk = false;
+    }
+    CHECK_MSG(parityOk, "棋盘变体里 (i+j) 为偶的中心必须取行方向、为奇的取列方向");
+    int centers = 0;
+    bool atMostOnce = true;
+    for (int v = 0; v < m.vertexCount(); ++v) {
+      if (centerHits[static_cast<std::size_t>(v)] > 1) atMostOnce = false;
+      if (centerHits[static_cast<std::size_t>(v)] == 1) ++centers;
+    }
+    CHECK_MSG(atMostOnce, "棋盘变体里每个中心顶点最多被取一次（不得同一顶点拿两个方向）");
+    CHECK_MSG(centers == added, "棋盘变体的每个 stencil 都有各自不同的中心顶点");
+    // 数量按"定义"独立数一遍：偶数和对的合法中心取行 + 奇数和对的合法中心取列。
+    // 注意它**不等于**单向的 (nx-2)*ny —— 行方向只覆盖 j 全部而 i 内点、列方向只覆盖 i 全部
+    // 而 j 内点，两者可取的中心集合不同，差的就是四个角附近的那些格子。
+    int checkerExpected = 0;
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 1; i + 1 < nx; ++i) {
+        if (((i + j) & 1) == 0) ++checkerExpected;
+      }
+    }
+    for (int i = 0; i < nx; ++i) {
+      for (int j = 1; j + 1 < ny; ++j) {
+        if (((i + j) & 1) != 0) ++checkerExpected;
+      }
+    }
+    CHECK_MSG(added == checkerExpected, "棋盘变体的 stencil 数应为 " +
+                                            std::to_string(checkerExpected) + "，实际 " +
+                                            std::to_string(added));
+    CHECK_MSG(added >= plain.bendCount() / 2 - 2 && added <= plain.bendCount() / 2 + 2,
+              "棋盘变体的规模应约为完整采样的一半（各方向各覆盖一半中心）");
+  }
+
+  // ---- ⑤ 结构性质：四种变体都必须仍是 标量 × I₃（`L = Ã ⊗ I₃`）----
+  const Scalar h = 1.0 / 120.0;
+  const BendGenOptions variants[] = {
+      BendGenOptions{BendSampling::Standard, 1},     BendGenOptions{BendSampling::RowsOnly, 1},
+      BendGenOptions{BendSampling::ColsOnly, 1},     BendGenOptions{BendSampling::Checkerboard, 1},
+      BendGenOptions{BendSampling::Standard, 2},     BendGenOptions{BendSampling::Checkerboard, 2},
+      BendGenOptions{BendSampling::RowsOnly, 3},
+  };
+  for (const BendGenOptions& opt : variants) {
+    Mesh m = Mesh::makeGrid(nx, ny, spacing);
+    m.addBendingStencils(nx, ny, k, opt);
+    m.pinned[5 * nx + 5] = 1;
+    m.pinPositions = m.positions;
+    Eigen::SparseMatrix<Scalar> L;
+    std::vector<Scalar> rhs;
+    assembleLeftHandSide(m, h, 0.0, L, &rhs);
+    const std::string tag = std::string(bendSamplingName(opt.sampling)) + "/" +
+                            std::to_string(opt.stride);
+    CHECK_MSG(L.rows() == 3 * m.vertexCount(),
+              "变体 " + tag + " 的左端矩阵规模必须仍是 3N");
+    CHECK_MSG(allBlocksAreScalarTimesIdentity(m, L),
+              "变体 " + tag + " 的每个 3×3 块必须仍是 标量 × I₃（⊗ 结构与三分量并行的前提）");
+  }
+}
+
+TEST(stridedBendingSamplingCannotSeeCoarseBendingSoItIsRejected) {
+  // 为什么"隔行采样"这条路被否掉 —— 这里把原因钉成**可构造的反例**，而不是只写在文档里。
+  //
+  // 道理：一条 stencil 在中心顶点上要求 `x_i = (x_{i-1} + x_{i+1})/2`（局部共线）。
+  // 只在**奇数**中心采样时，偶数顶点那一层子格子完全不受约束：把奇数顶点取成两侧偶数
+  // 顶点的**中点**，则所有被采样约束的 `A_c x` **恰好为 0**，而偶数子格子可以任意弯 ——
+  // 弯曲自由度整体搬到了没被采样的子格子上。所以隔行采样不是"弯曲刚度小一半"，
+  // 而是**对粗尺度弯曲几乎没有阻抗**（实测：k 从 1e3 加到 1e5，应变只变 0.4 %；
+  // 而完整采样变 76 %。见 docs/perf.md §13）。
+  //
+  // 本测试用的数字都是二进制精确值（0.5 的整数倍），所以断言是"严格等于 0"而不是阈值。
+  const int nx = 9;
+  const int ny = 2;
+  const Scalar k = 1000.0;
+  const Scalar c = 1.0;  // 偶数子格子的二次剖面 y = c·(i/2)²
+
+  Mesh m = Mesh::makeGrid(nx, ny, 1.0);
+  m.addBendingStencils(nx, ny, k, BendGenOptions{BendSampling::Standard, 2});
+  // stride = 2 ⇒ 行中心只取 i = 1,3,5,7（ny = 2 ⇒ 列方向没有内点，自然 0 条）
+  CHECK_MSG(m.bendCount() == 8, "9x2 网格、步长 2 只应生成两行 × 4 个行中心 = 8 条");
+  for (const BendStencil& s : m.bends) {
+    CHECK((s.b % nx) % 2 == 1);  // 中心必须都是奇数 i
+  }
+
+  // 偶数顶点：粗尺度**强弯曲**的二次剖面（0, c, 4c, 9c, 16c）；
+  // 奇数顶点：取两侧偶数顶点的中点 ⇒ 恰好满足全部被采样的约束。
+  const Scalar evenProfile[5] = {0.0, 1.0, 4.0, 9.0, 16.0};
+  for (int j = 0; j < ny; ++j) {
+    for (int i = 0; i < nx; ++i) {
+      Scalar y = 0.0;
+      if (i % 2 == 0) {
+        y = evenProfile[i / 2] * c;
+      } else {
+        const int kk = (i - 1) / 2;
+        y = 0.5 * (evenProfile[kk] + evenProfile[kk + 1]) * c;  // 0.5, 2.5, 6.5, 12.5
+      }
+      m.positions[static_cast<std::size_t>(j * nx + i)] = Vec3{static_cast<Scalar>(i), y, 0.0};
+    }
+  }
+
+  // ① 被采样的约束严格全为 0（"看不见"这个位形）。
+  Scalar worstSampled = 0.0;
+  for (const BendStencil& s : m.bends) {
+    const Vec3 second = m.positions[static_cast<std::size_t>(s.a)] -
+                        m.positions[static_cast<std::size_t>(s.b)] * 2.0 +
+                        m.positions[static_cast<std::size_t>(s.c)];
+    worstSampled = std::max(worstSampled, static_cast<Scalar>(length(second)));
+  }
+  CHECK_MSG(worstSampled == 0.0, "隔行采样下必须能构造出「被采样约束严格全为 0」的位形");
+
+  // ② 但它**明显不是直线**（否则这个反例没有意义）：
+  // 中点的 y = 4c，而两端点连线在中点的值 = (0 + 16c)/2 = 8c ⇒ 偏离 4c（非常大）。
+  const Scalar midY = m.positions[static_cast<std::size_t>(4)].y;
+  const Scalar chordY = 0.5 * (m.positions[0].y + m.positions[static_cast<std::size_t>(nx - 1)].y);
+  CHECK_NEAR(midY, 4.0 * c, 1e-15);
+  CHECK_NEAR(chordY, 8.0 * c, 1e-15);
+  CHECK_MSG(std::abs(midY - chordY) > 1.0, "该位形是强弯曲的（中点偏离弦 4c），不是直线");
+
+  // ③ 同一个位形在**完整采样**下必须被"看见"：偶数中心 i = 2 处的二阶差分为
+  // y_1 - 2y_2 + y_3 = 0.5c - 2c + 2.5c = c ≠ 0 ⇒ 完整采样确实能阻抗它。
+  // 这正是"隔行采样不是完整采样的近似，而是另一个（退化的）约束集"的证据。
+  const Scalar secondAtEvenCenter = m.positions[1].y - 2.0 * m.positions[2].y + m.positions[3].y;
+  CHECK_NEAR(secondAtEvenCenter, c, 1e-15);
+  CHECK_MSG(secondAtEvenCenter != 0.0,
+            "同一个位形在完整采样下必须非零（完整采样若也看不见它，那这条断言就没有分辨力）");
+
+  // ④ 顺带钉住"完整采样下中心必须覆盖全部内点"：正是这条保证了上面的位形无处可藏。
+  // nx = 9 ⇒ 行中心 i = 1..7 共 7 个/行，其中偶数中心 3 个（2/4/6），2 行共 6 个。
+  Mesh full = Mesh::makeGrid(nx, ny, 1.0);
+  full.addBendingStencils(nx, ny, k, BendGenOptions{BendSampling::Standard, 1});
+  int evenCenters = 0;
+  for (const BendStencil& s : full.bends) {
+    if ((s.b % nx) % 2 == 0) ++evenCenters;
+  }
+  CHECK_MSG(evenCenters == 6,
+            "完整采样必须覆盖全部内点中心（含偶数中心 6 个）—— 那类位形因此无处可藏");
+}
+
 TEST_MAIN("primitives/distance_term")

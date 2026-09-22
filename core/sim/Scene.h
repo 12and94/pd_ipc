@@ -118,6 +118,15 @@ struct SceneConfig {
   /// 手感不同"。要尺度无关得改成 `k·s⁴`（或按质量参数化，与 κ 的处理原则一致）。
   Scalar bendStiffness = 0.0;
 
+  /// **弯曲 stencil 的采样形状**（见 `BendSampling`）：默认 `Standard` = 行列全取、
+  /// 步长 1，即"照旧"。它只决定**取哪些** stencil，不改变任何架构性质（stencil 变少 ⇒
+  /// ⊗ 结构、只分解一次、三分量并行都自动成立），代价是各向异性与等效刚度变软：
+  /// 采样密度降到 1/s，就要把 `bendStiffness` 大致乘 s 补回来（实测标定见 docs/perf.md §13）。
+  BendSampling bendSampling = BendSampling::Standard;
+
+  /// 弯曲 stencil 中心顶点的采样步长（>= 1；2 = 隔一个取一个）。默认 1。
+  int bendStride = 1;
+
   // ---- 诊断 ----
   bool verbose = false;
   int reportEvery = 0;  ///< >0 时每 N 步打印一次状态

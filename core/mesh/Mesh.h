@@ -57,6 +57,42 @@ struct BendStencil {
   Scalar stiffness = 0.0;  ///< 即文档中的 k（能量系数，不是半能量系数）
 };
 
+/// **弯曲 stencil 的采样形状**（`addBendingStencils` 的代价–质量折中开关）。
+///
+/// 背景：弯曲的代价几乎全在**消元填充**上（40×40 / k=1000：L nnz +78 %，而因子 nnz +177 %，
+/// 单子步 +73 %，见 docs/perf.md §12）。填充由"每个未知量被多少约束耦合"决定，而弯曲
+/// stencil 的耦合半径是 2（连着三个顶点），所以**减少 stencil 数量是直接打在填充上的手段**，
+/// 而且它完全不碰架构性质：stencil 变少 ⇒ ⊗ 结构、只分解一次、三分量并行全都自动成立。
+///
+/// 代价是**弯曲响应的各向异性/离散化误差**：stencil 少了，等效抗弯刚度也变软，
+/// 要按采样密度把刚度放大回去（密度 1/s ⇒ 刚度 ×s 量级），这一步必须实测标定。
+///
+/// 注意：无论取哪种采样，**端点依旧不生成**（自由端边界，见下）。
+enum class BendSampling {
+  /// 行、列都取，中心顶点全取 —— 今天的行为，也是默认值。
+  Standard = 0,
+  /// 只取**行方向**（沿 i 的连续三个顶点）：stencil 数 ≈ 1/2，只有横向纤维抗弯。
+  RowsOnly = 1,
+  /// 只取**列方向**（沿 j 的连续三个顶点）：stencil 数 ≈ 1/2，只有纵向纤维抗弯。
+  ColsOnly = 2,
+  /// **棋盘交替**：每个中心顶点只在"行/列"里取一个方向，方向由 `(i+j)` 的奇偶决定
+  /// ⇒ stencil 数 ≈ 1/2，但两个方向都还在（各覆盖约一半的顶点），各向异性比单向小。
+  Checkerboard = 3,
+};
+
+/// `BendSampling` 的可读名字（用于日志/审计打印）。
+const char* bendSamplingName(BendSampling s);
+
+/// 弯曲 stencil 的生成选项。默认值 = `Standard` + 步长 1，与不传本结构时**逐位相同**。
+struct BendGenOptions {
+  BendSampling sampling = BendSampling::Standard;
+
+  /// 中心顶点的采样步长（`>= 1`）：`2` = 隔一个取一个，stencil 数 ≈ 1/2；`3` ≈ 1/3。
+  /// 行方向按 `i` 计数、列方向按 `j` 计数，都从第一个可用中心（`i == 1` / `j == 1`）起算，
+  /// 因此 `stride = 2` 的结果**是** `stride = 1` 结果的**严格子集**（测试里有断言）。
+  int stride = 1;
+};
+
 class Mesh {
  public:
   // ---- 顶点数据 ----
@@ -116,8 +152,10 @@ class Mesh {
   ///
   /// **调用后本函数会自动重建稀疏结构与约束着色/关联表**（拓扑级数据），
   /// 照抄 `addShearDiagonals` 的做法：漏掉重建会踩越界读，那条注释记录了实际踩过的坑。
+  /// `opt` 只影响**取哪些 stencil**（见 `BendGenOptions`）；默认值即"行列全取、步长 1"。
   /// 返回新增的 stencil 数。
-  int addBendingStencils(int nx, int ny, Scalar stiffness);
+  int addBendingStencils(int nx, int ny, Scalar stiffness,
+                         const BendGenOptions& opt = BendGenOptions{});
 
   /// 从 OBJ 读取三角网格，再按"共享边的两个顶点"建立距离约束。
   /// 返回 false 表示文件不可读或没有可用几何。
