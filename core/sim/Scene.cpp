@@ -2,6 +2,8 @@
 #include "core/sim/Scene.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "core/assemble/Assembler.h"
 #include "core/solver/EigenDirectSolver.h"
@@ -37,6 +39,29 @@ SimContext makeScene(const SceneConfig& config) {
   } else {
     // 规则网格：用静止长度作为面积份额的代理（与网格生成时的口径一致）。
     m.computeMassesFromEdges(density);
+  }
+
+  // ---- 剪切（对角）约束：可选，默认关闭（`SceneConfig::shearStiffness == 0`）----
+  //
+  // 对角边就是一条普通的距离约束（`Edge`），所以装配、边着色、投影/散射、残差、
+  // 以及 Phase 4c 的"三分量并行"都不需要任何改动；两条架构性质也不受影响：
+  // ① 左端矩阵仍与位形无关 ⇒ 只分解一次；② 每块仍是标量 × I₃ ⇒ L = Ã ⊗ I₃ 保住。
+  //
+  // 位置刻意放在**质量计算之后**：这样"带剪切"与"不带剪切"的场景质量完全一致，
+  // 对照实验里唯一的变量就是约束集（否则质量一变，动力学跟着变，数字不可比）。
+  // 也支持用环境变量 `PD_SHEAR=<刚度>` 临时开启 —— 方便 bench/viewer 做对照，
+  // 不必扩命令行解析（同 PD_TRACE_STEP 那类诊断开关的用法）。
+  {
+    Scalar shear = config.shearStiffness;
+    if (const char* env = std::getenv("PD_SHEAR")) {
+      const double v = std::atof(env);
+      if (v > 0.0) shear = static_cast<Scalar>(v);
+    }
+    if (shear > 0.0 && config.meshPath.empty()) {
+      const int added = ctx.mesh.addShearDiagonals(config.gridNx, config.gridNy, shear);
+      std::printf("[scene] 剪切约束：新增对角边 %d 条（刚度 %g）⇒ 总边数 %d\n", added,
+                  static_cast<double>(shear), ctx.mesh.edgeCount());
+    }
   }
 
   // ---- 默认 pin：规则网格把顶边（j = ny-1）两端的顶点钉住 ----

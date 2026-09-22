@@ -180,6 +180,32 @@ void Mesh::computeMassesFromEdges(Scalar density) {
   }
 }
 
+int Mesh::addShearDiagonals(int nx, int ny, Scalar stiffness) {
+  if (nx < 2 || ny < 2) return 0;
+  if (vertexCount() != nx * ny) return 0;  // 只对规则网格有意义
+  const int before = edgeCount();
+  for (int j = 0; j + 1 < ny; ++j) {
+    for (int i = 0; i + 1 < nx; ++i) {
+      const std::size_t a = static_cast<std::size_t>(j * nx + i);              // 左下
+      const std::size_t c = static_cast<std::size_t>((j + 1) * nx + (i + 1));  // 右上
+      Edge e;
+      e.a = static_cast<int>(a);
+      e.b = static_cast<int>(c);
+      e.restLength = length(restPositions[c] - restPositions[a]);
+      e.stiffness = stiffness;
+      edges.push_back(e);
+    }
+  }
+  const int added = edgeCount() - before;
+  // **必须在这里重建**（而不是留给调用方）：稀疏结构与约束着色/顶点关联表都是拓扑级数据，
+  // 加了边却不重建，残差的 gather 会拿过期的 CSR 当循环边界 → 越界读（实测表现为卡住不返回）。
+  // 2026-09-22 真的漏过一次，被 DistanceTerm 的契约检查当场挡下：
+  //   "[residual] 违反前置条件：顶点关联表已过期 —— vertexEdges 6240 项（期望 9282）"。
+  // 本函数只在场景构造期（串行、区域外）调用，代价是一次 O(E) 的重建。
+  if (added > 0) buildSparsityPattern();
+  return added;
+}
+
 void Mesh::buildSparsityPattern() {
   // 结构 = 对角块 + 每条约束引入的两个非对角块。
   // 该结构只依赖拓扑，与位形、刚度无关，因此只需构建一次。

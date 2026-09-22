@@ -160,7 +160,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 #   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 132 断言（20 个测试；含并行散射分支、约束着色、全局步三分量拆分、投影+散射融合的对照）
+.\build\Release\test_primitives.exe         # 136 断言（21 个测试；含并行散射、约束着色、全局步三分量拆分、投影+散射融合、剪切对角边的构造）
 .\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
 .\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
 

@@ -766,4 +766,22 @@ TEST(fusedProjectScatterMatchesSplitPath) {
             "融合路径与两趟路径必须逐位相同（两条路共用同一份算术 helper）");
 }
 
+TEST(shearDiagonalsAreAddedOnceAndKeepEdgeUniqueness) {
+  // 剪切约束（对角边）的构造断言。它本身是普通 `Edge`，所以真正要钉的是**网格构造**：
+  //   · 默认（不调用本函数）时边表与历史完全一致 —— 所有基线不受影响；
+  //   · 每个四边形恰好多一条对角线，且**不产生重复边**（4-邻域边表里没有对角线，
+  //     但这条断言是防止将来有人改成交叉对角线或两种对角线都加时忘了去重）。
+  const int nx = 20;
+  const int ny = 20;
+  Mesh base = Mesh::makeGrid(nx, ny, 0.05);
+  CHECK(base.edgeCount() == 2 * nx * ny - nx - ny);  // 760：默认约束集不变
+
+  Mesh sheared = Mesh::makeGrid(nx, ny, 0.05);
+  const int added = sheared.addShearDiagonals(nx, ny, 1.0e3);
+  CHECK_MSG(added == (nx - 1) * (ny - 1), "每个四边形应恰好多一条对角边");
+  CHECK_MSG(sheared.edgeCount() == base.edgeCount() + (nx - 1) * (ny - 1),
+            "总边数 = 4-邻域边 + 对角边");
+  CHECK_MSG(sheared.countDuplicateEdges() == 0, "对角边不应与已有边重复");
+}
+
 TEST_MAIN("primitives/distance_term")

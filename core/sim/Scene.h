@@ -94,6 +94,13 @@ struct SceneConfig {
   Scalar gridSpacing = 0.025;
   std::string meshPath;  ///< 非空则从 OBJ 载入，忽略 gridNx/gridNy
 
+  /// **剪切（对角）约束的刚度**：> 0 时给规则网格的每个四边形加一条对角边（见
+  /// `Mesh::addShearDiagonals`），提供抗剪切。**默认 0 = 不启用** —— 此时网格、边表、
+  /// 装配矩阵与之前完全一致（所有历史基线与断言都不受影响）。
+  /// 注：它复用"距离约束"的整套实现（装配/着色/投影/散射/三分量并行），所以不影响
+  /// "与位形无关、只分解一次"与 `L = Ã ⊗ I₃` 这两条架构性质。
+  Scalar shearStiffness = 0.0;
+
   // ---- 诊断 ----
   bool verbose = false;
   int reportEvery = 0;  ///< >0 时每 N 步打印一次状态
