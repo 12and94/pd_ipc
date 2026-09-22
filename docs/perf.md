@@ -586,6 +586,12 @@ scatter 对 1–40 MB 数据的访问，因子是**冷的**）它要多读一整
 | 200×200 / iters 10 / 4T（仅 12 子步） | 75.549 ms | 51.684 ms | **−31.6 %** | 677.9 ms | 379.7 ms | −44.0 % |
 
 - 主工况从 **4.966 → 2.867 ms/子步**；相对本文件 §1 记录的改造前基线（18T 13.865 ms），累计 **4.8×**。
+- **上表是第一轮测量**。看板用的是 `build/_perf/refresh_report.ps1` 生成的**第二轮**（同轮会话内交替 5 次
+  取最小；与第一轮差 0.5 个百分点以内，属噪声）：40×40/4T **4.997 → 2.910（−41.8 %）**、
+  18T 7.257 → 4.097（−43.5 %）、交互档 0.663 → 0.385（−41.9 %）、100×100 11.714 → 5.969（−49.0 %）、
+  200×200 92.123 → 65.796（−28.6 %）。看板生成链：
+  `.\build\_perf\refresh_report.ps1`（写 `build/_perf/logs/` 与 `build/_baseline/phase4c_ab.log`）
+  → `node build\_perf\make_report.js` → `node build\_perf\serve.js`（http://127.0.0.1:8137/）。
 - 200×200 只跑了 12 个子步 ⇒ 一次性"组装+分解"被摊进单子步，**这个数字偏保守**
   （同样的记账问题在 §5 关于看板的注里提过）。
 - 1T 只有 −2.9 %：这条路径没有并行可拿，变化来自"按分量的列表"的局部性（solve 桶 −5.1 %）
@@ -672,6 +678,12 @@ node build\_perf\serve.js                # 可选：静态服务，浏览器开 
 # Phase 4c 的生产 A/B：交替跑改动前存档的二进制与本版（同一会话、各取最小值）
 .\build\_baseline\pd_bench_pre_comp.exe --grid 40 40 --steps 300 --iters 40 --residual-tol 0.3 --threads 4
 .\build\Release\pd_bench.exe           --grid 40 40 --steps 300 --iters 40 --residual-tol 0.3 --threads 4
+
+# Phase 4c 的看板数据刷新（① 线程扫描日志 ② phase4c_ab.log）→ 重生成 → 起静态服务
+.\build\_perf\refresh_report.ps1            # 约 3 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
+node build\_perf\make_report.js             # 生成 build\_perf\perf-report.html
+node build\_perf\check_report.js            # 几何自检（段数 / 越界 / 标尺文本）
+node build\_perf\serve.js                   # http://127.0.0.1:8137/
 ```
 
 > **每次触及热路径的改动都要在本文件补"前后对照"**（`docs/contributing.md` §6），
