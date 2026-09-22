@@ -131,6 +131,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | `_verify/translation_invariance.cpp` | 平移不变性：无重力时零位移、pin 平移后相对形状不变 |
 | `_verify/chain_test.cpp` | 自由链/悬挂链与解析式对照 |
 | `_verify/direction_audit.cpp` | 投影方向三项判据（全局一致 / 物理合理 / 与标准 PD 逐位一致） |
+| `_verify/solve_audit.cpp` | **全局步求解器可行性审计**（`pd_solveaudit`）：延迟/带宽性质、因子层集与关键路径、换排序/分解的对照，以及"层调度并行回代"的原型（含正确性自证）。结论见 `docs/solver-feasibility.md`；**只测量，不改生产代码** |
 
 > **以下程序是排查期留下的，前提假设部分已过期，不是受支持的验收集**（见 `README.md` §4）：
 > `one_step_trace`、`standard_pd`、`steady`、`rhs_breakdown`、`force_audit`、`kappa_effect`、

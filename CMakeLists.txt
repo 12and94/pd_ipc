@@ -150,6 +150,10 @@ target_link_libraries(pd_iterscan PRIVATE pd_core)
 add_executable(pd_check _verify/check.cpp)
 target_link_libraries(pd_check PRIVATE pd_core)
 
+# 全局步求解器可行性审计（只测量：延迟/带宽性质、因子层集与关键路径、换排序的对照）
+add_executable(pd_solveaudit _verify/solve_audit.cpp)
+target_link_libraries(pd_solveaudit PRIVATE pd_core)
+
 # ---------------------------------------------------------------------------
 # 无窗口基准（CI 与性能基线用）
 # ---------------------------------------------------------------------------

@@ -255,6 +255,11 @@ Phase 3 又把这个差距推到 **−6.4 %…−11.3 %**（§7.2）。
 Amdahl 上界很清楚：即使把回代之外的一切都并行到 0，也只能再拿掉 ~24 %；
 要真正再上一个台阶，必须动求解器本身（Phase 4 的范围）。
 
+> **动求解器的可行性已经量过了** —— 见 `docs/solver-feasibility.md`（2026-09-22，工具 `pd_solveaudit`）：
+> 回代是**延迟受限**（达成带宽只有流式读写的 9–13 %）；层调度的并行回代原型实测只值 0.81×/1.45×/1.39×
+> （40×40 / 100×100 / 200×200，相对 Eigen 串行），而**手写的串行回代内核（索引序）比 Eigen 的
+> `solve` 快 19–29 %** 且不需要任何并发 —— 那才是这里性价比最高的一项。
+
 > **注意本节表格里的 18 线程数字是"旧默认"下的历史记录**，其价值在于说明"线程开太多会倒退"；
 > 当前默认是 4 线程（§6），引用性能时必须写明线程数。
 
@@ -465,6 +470,9 @@ Remove-Item Env:\PD_DEBUG_RESIDUAL
 # 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3 A/B + 查看器时间线）
 node build\_perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
 node build\_perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
+
+# 全局步（回代）的可行性审计：性质 / 层集 / 换排序 / 并行原型（结论见 docs/solver-feasibility.md）
+.\build\Release\pd_solveaudit.exe --grid 200 200 --order amd --solves 40 --proto-threads 1,2,4,8
 ```
 
 > **每次触及热路径的改动都要在本文件补"前后对照"**（`docs/contributing.md` §6），
