@@ -281,7 +281,7 @@ int stepOnce(SimContext& ctx) {
   //     · 惯性右端 → 散射(以 bBase 为基值)：同上，single 的 barrier 已保证；
   //     · 局部步 → 散射：散射内部的 single（清缓冲）带隐式 barrier；
   //     · 散射 → pin 覆盖 / 回代：散射的归约趟是 `omp for`（带隐式 barrier）；
-  //     · 回代 → 解包+判据：pin 覆盖与回代合在同一个 single 里，其 barrier 覆盖；
+  //     · 回代 → 解包+判据：pin 覆盖与回代合在同一个 `omp for` 里，其末尾 barrier 覆盖；
   //     · 迭代末尾：判据 single 的 barrier 让所有线程看到同一个 `ctx.converged`，
   //       因此 `break` 在所有线程上一致（OpenMP 要求如此）。
   //
@@ -380,17 +380,30 @@ int stepOnce(SimContext& ctx) {
         if (threadId() == 0) ctx.times.scatter += secondsSince(t0);
       }
 
-      // 4d) 覆盖 pinned 行 + 4e) 全局步（都是一次回代；合在一个 single 里省一次 barrier）
+      // 4d) 覆盖 pinned 行 + 4e) 全局步
+      //
+      // **2026-09-22：这里从 `omp single` 改成了 `omp for`。**
+      // 回代占单子步 76 %，一直是 Amdahl 天花板；但本项目**不需要**并行化三角求解本身 ——
+      // L 的每一块都是标量 × I₃（L = Ã ⊗ I₃，见 Assembler.cpp 与 DistanceTerm::assembleMatrix），
+      // 所以 3n 个方程其实是 3 个**互不相连**的标量系统，可以按 x/y/z 拆成 3 条独立链：
+      // 零同步、零竞争、而且每个分量的算术序列与整趟完全一致 ⇒ **结果逐位相同**。
+      // 回代是延迟受限的（达成带宽只有流式读写的 9–13 %），3 条链分给 3 条线程正好把
+      // "未决访存请求数"提高约 3 倍：实测单次回代快 2.0–2.8×（docs/perf.md §9）。
+      // 结构不满足时 parallelComponents() 返回 1，循环只有 1 个迭代，行为与原来的 single 一致。
       {
         const auto t0 = Clock::now();
+        const int nComp = ctx.solver->parallelComponents();
 #ifdef _OPENMP
-#pragma omp single
+#pragma omp for schedule(static, 1)
 #endif
-        {
-          applyPinRhs(m, ctx.b);
-          ctx.solver->solve(ctx.b, ctx.xSolution);
-          ctx.times.solve += secondsSince(t0);
+        for (int c = 0; c < nComp; ++c) {
+          applyPinRhsComponent(m, ctx.b, c, nComp);
+          ctx.solver->solveComponent(c, ctx.b, ctx.xSolution);
         }
+        // 计时口径随构造一起变了（**引用本桶数字时必须留意**）：
+        //   原来 = 唯一执行者自己的执行时间（不含 barrier 等待）；
+        //   现在 = 本阶段的**墙钟**（含等最慢的那条线程），与散射/解包桶口径一致。
+        if (threadId() == 0) ctx.times.solve += secondsSince(t0);
       }
 
       // 4f) 解包 + 收敛扫描 + previous 更新 + **非线性残差**（逐顶点融合成一趟）

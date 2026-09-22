@@ -12,10 +12,14 @@
 // 回代快 10–20 %（回代占单子步 76 % ⇒ 整体 −8…−18 %），而**数值结果与它逐位相同**
 // （累加顺序没变）。详见 docs/perf.md §8。
 //
-// 诚实说明（docs/plan.md D12）：稀疏三角求解是**单线程**的（我们的实现也是），
-// 因此全局步的并行加速无从谈起；全局步的快来自"分解复用"而不是并行。
-// 并行回代的可行性也量过了：层调度原型只值 0.81×/1.45×/1.39×（40×40/100×100/200×200），
-// 不值得做 —— 见 docs/solver-feasibility.md §3。
+// 诚实说明（docs/plan.md D12）：稀疏三角求解**本身**是单线程的（我们的实现也是）。
+// 但本项目**不需要**并行化三角求解本身 —— L 的每一块都是标量 × I₃（L = Ã ⊗ I₃，
+// 见 core/assemble/Assembler.cpp 与 DistanceTerm::assembleMatrix），所以 3n 个方程
+// 其实是 3 个互不相连的标量系统，可以按 x/y/z 拆成 3 条**零同步**的独立链。
+// 那个才是"全局步的多线程加速"：实测单次回代快 2.0–2.8×，且结果逐位不变
+// （见 IGlobalSolver::parallelComponents 的说明与 docs/perf.md §9）。
+// 三角求解**内部**的并行（层调度）量过多次：只值 0.81×/1.45×/1.39×
+// （40×40/100×100/200×200），不值得做 —— 见 docs/solver-feasibility.md §3。
 #pragma once
 
 #include <memory>
@@ -34,6 +38,8 @@ class EigenDirectSolver final : public IGlobalSolver {
   void analyze(int n, const Eigen::SparseMatrix<Scalar>& patternMatrix) override;
   void factorize(const Eigen::SparseMatrix<Scalar>& L) override;
   void solve(const Eigen::VectorXd& b, Eigen::VectorXd& x) override;
+  int parallelComponents() const override;
+  void solveComponent(int c, const Eigen::VectorXd& b, Eigen::VectorXd& x) override;
   const Stats& stats() const override { return stats_; }
 
   /// 是否已完成符号分解。

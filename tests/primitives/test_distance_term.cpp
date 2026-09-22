@@ -9,11 +9,14 @@
 #include "core/energy/DistanceTerm.h"
 #include "core/math/Parallel.h"
 #include "core/mesh/Mesh.h"
+#include "core/solver/EigenDirectSolver.h"
 #include "tests/primitives/test_harness.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <string>
 
 using namespace pd;
@@ -639,6 +642,92 @@ TEST(constraintColoringIsDeterministicAndTopologyOnly) {
   CHECK_MSG(after.colorOf == reference.colorOf, "位形/刚度/pin 变了，着色不应改变");
   CHECK_MSG(after.order == reference.order, "位形/刚度/pin 变了，分组不应改变");
   CHECK_MSG(after.colorCount == reference.colorCount, "位形/刚度/pin 变了，颜色数不应改变");
+}
+
+// ---------------------------------------------------------------------------
+// 8) 全局步按 x/y/z 三分量拆分（L = Ã ⊗ I₃，2026-09-22）
+//
+// 为什么必须钉住这三条：这条改造把全局步从"一次 3n 三角求解"变成"3 条互不相干的链"，
+// 收益全来自"分给 3 条线程"（实测单次回代快 2.0–2.8×），而它之所以是**零风险**改造，
+// 全靠下面两个性质 —— 任一条破了，它就从"不改变任何物理结果"变成"悄悄改了物理"：
+//   ① L 的每一块都是标量 × I₃（惯性 m/h²·I、约束 ±κ·I、pin 行 I）
+//      ⇒ 图是 3 个互不相连的连通分量 ⇒ 消元填充不可能跨分量 ⇒ 因子按分量块对角，
+//      于是 solveComponent(c) 只碰自己那 1/3 的自由度（无竞争、无同步）；
+//   ② 各分量的算术序列与整趟完全一致（列顺序、i>j 筛选、累加顺序都不变）
+//      ⇒ 结果**逐位相同**（不是"1e-12 内相同"）。
+// 另外 pin 覆盖也必须能按分量拆 —— 否则并行路径会漏写 2/3 的 pin 行。
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 组装并分解一个 20x20 扰动网格（含 pin），返回可直接求解的求解器。
+std::unique_ptr<EigenDirectSolver> makeFactorizedSolver(const Mesh& m, Scalar dt,
+                                                        Eigen::SparseMatrix<Scalar>& lOut) {
+  assembleLeftHandSide(m, dt, 0.0, lOut);
+  auto solver = std::make_unique<EigenDirectSolver>();
+  solver->analyze(3 * m.vertexCount(), lOut);
+  solver->factorize(lOut);
+  return solver;
+}
+
+/// 一个非平凡右端：b = (M/h²)·x̂（与生产同款）再覆盖 pin 行。
+Eigen::VectorXd makeComponentTestRhs(const Mesh& m, Scalar dt) {
+  std::vector<Vec3> predicted = m.positions;
+  for (std::size_t i = 0; i < predicted.size(); ++i) {
+    predicted[i] = predicted[i] + Vec3{1e-3 * static_cast<Scalar>(i % 13),
+                                       -2e-3 * static_cast<Scalar>(i % 7),
+                                       3e-3 * static_cast<Scalar>(i % 5)};
+  }
+  Eigen::VectorXd b;
+  assembleInertialRhs(m, predicted, dt, 0.0, b);
+  applyPinRhs(m, b);
+  return b;
+}
+
+bool sameBits(const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
+  if (a.size() != b.size() || a.size() == 0) return false;
+  return std::memcmp(a.data(), b.data(),
+                     sizeof(Scalar) * static_cast<std::size_t>(a.size())) == 0;
+}
+
+}  // namespace
+
+TEST(globalSolveSplitsIntoThreeComponentChains) {
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+  Eigen::SparseMatrix<Scalar> L;
+  auto solver = makeFactorizedSolver(m, 1.0 / 120.0, L);
+  CHECK_MSG(solver->parallelComponents() == 3,
+            "L = Ã ⊗ I₃（图是 3 个连通分量）时应当能拆成 3 个分量，实际 " +
+                std::to_string(solver->parallelComponents()));
+}
+
+TEST(componentSolveMatchesFullSolveBitwise) {
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+  Eigen::SparseMatrix<Scalar> L;
+  auto solver = makeFactorizedSolver(m, 1.0 / 120.0, L);
+  const int n = 3 * m.vertexCount();
+  const Eigen::VectorXd b = makeComponentTestRhs(m, 1.0 / 120.0);
+  CHECK_MSG(b.cwiseAbs().maxCoeff() > 0.0, "右端不应全零，否则这个测试等于没测");
+
+  Eigen::VectorXd xFull(n), xSplit(n);
+  solver->solve(b, xFull);
+  for (int c = 0; c < solver->parallelComponents(); ++c) {
+    solver->solveComponent(c, b, xSplit);
+  }
+  CHECK_MSG(sameBits(xFull, xSplit),
+            "按分量拆分求解必须与整趟**逐位相同**（每个分量的算术序列没变）");
+}
+
+TEST(componentPinOverwriteMatchesFullPinOverwrite) {
+  Mesh m = makePerturbedGrid(20, 0.02, 2.0e3);
+  const Eigen::VectorXd base = makeComponentTestRhs(m, 1.0 / 120.0);
+  Eigen::VectorXd whole = base;
+  applyPinRhs(m, whole);
+  Eigen::VectorXd split = base;
+  for (int c = 0; c < 3; ++c) applyPinRhsComponent(m, split, c, 3);
+  CHECK_MSG(sameBits(whole, split), "三分量分别覆盖 pin 行必须与整份覆盖逐位相同");
+  Eigen::VectorXd single = base;
+  applyPinRhsComponent(m, single, 0, 1);
+  CHECK_MSG(sameBits(whole, single), "components == 1 时 applyPinRhsComponent 必须等价于 applyPinRhs");
 }
 
 TEST_MAIN("primitives/distance_term")

@@ -65,6 +65,37 @@ class IGlobalSolver {
   /// 求解 L x = b。支持多右端（Eigen 的 solve(B)）以便将来批处理。
   virtual void solve(const Eigen::VectorXd& b, Eigen::VectorXd& x) = 0;
 
+  /// **可拆分的独立分量个数**（1 = 只能整趟求解，调用方退回单线程）。
+  ///
+  /// 为什么会有多个（2026-09-22 的新发现，实测见 docs/perf.md §9）：
+  /// 本项目 L 的每一块都是**标量 × I₃** —— 惯性项 (m_v/h²) 出现在 (3v+d, 3v+d)、
+  /// 距离约束块 ±κ 出现在 (3a+d, 3b+d)（d 不变）、pin 行 (3v+d, 3v+d) = 1
+  /// （见 Assembler.cpp 与 DistanceTerm::assembleMatrix）。也就是 L = Ã ⊗ I₃：
+  /// 3n 个方程其实是 3 个**互不相连**的标量系统（x/y/z 完全解耦），而且消元产生的
+  /// 填充不可能跨连通分量 ⇒ 因子是 3 份结构同构的标量因子。
+  ///   · 于是"一次 3n 三角求解"可以拆成 3 条**互不相干**的链：零同步、零竞争；
+  ///   · 每个分量的算术序列与整趟完全一致（列顺序、i>j 筛选、累加顺序都不变）
+  ///     ⇒ **结果逐位相同**（`pd_solvecomp` 与测试里的断言都钉住这条性质）；
+  ///   · 回代是延迟受限的（达成带宽只有流式读写的 9–13 %，见 docs/solver-feasibility.md §2），
+  ///     瓶颈是"未决访存请求数"不足 —— 3 条独立链分给 3 条线程正好把它提高约 3 倍。
+  ///     实测单次回代快 **2.0–2.8×**（40×40 / 100×100 / 200×200，见 docs/perf.md §9）。
+  ///
+  /// 结构不满足时（自由度不是 3 的倍数、或填充跨分量 —— 将来加入各向异性/非 ⊗ 的
+  /// 能量项就会这样）返回 1，调用方自动退回整趟求解。
+  virtual int parallelComponents() const { return 1; }
+
+  /// 求解第 c 个分量（c ∈ [0, parallelComponents())）：只读写属于该分量的自由度。
+  ///
+  /// 契约：
+  ///   · 不同 c 之间**内存完全不相交** ⇒ 可从多条线程并发调用（同步由调用方负责）；
+  ///   · 调用前 x 必须已经是长度 n 的向量（拆分路径里不允许 resize —— 多线程下不安全）；
+  ///   · x 的其它分量保持不动；
+  ///   · parallelComponents() == 1 时等价于 solve()（此时允许 x 为空、自动 resize）。
+  virtual void solveComponent(int c, const Eigen::VectorXd& b, Eigen::VectorXd& x) {
+    (void)c;
+    solve(b, x);
+  }
+
   /// 诊断：符号分解 / 数值分解 / 回代的累计次数与最近一次耗时（秒）。
   struct Stats {
     int analyzeCalls = 0;

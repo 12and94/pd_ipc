@@ -154,6 +154,10 @@ target_link_libraries(pd_check PRIVATE pd_core)
 add_executable(pd_solveaudit _verify/solve_audit.cpp)
 target_link_libraries(pd_solveaudit PRIVATE pd_core)
 
+# 全局步回代"按 x/y/z 三分量拆分"的可行性与收益（结构自检 + 逐位比对 + 微基准）
+add_executable(pd_solvecomp _verify/solve_components.cpp)
+target_link_libraries(pd_solvecomp PRIVATE pd_core)
+
 # ---------------------------------------------------------------------------
 # 无窗口基准（CI 与性能基线用）
 # ---------------------------------------------------------------------------

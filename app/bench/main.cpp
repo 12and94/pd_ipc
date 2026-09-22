@@ -199,13 +199,18 @@ int main(int argc, char** argv) {
   std::printf("  符号分解耗时 %.3f ms\n", st.lastAnalyzeSeconds * 1e3);
   std::printf("  单次数值分解 %.3f ms（累计 %.3f ms）\n", st.lastFactorizeSeconds * 1e3,
               st.totalFactorizeSeconds * 1e3);
-  std::printf("  单次回代 %.3f ms（累计 %.3f ms）\n", st.lastSolveSeconds * 1e3,
+  // 单次回代用"累计 / 次数"而不是 lastSolveSeconds：全局步现在按 x/y/z 三个分量并行
+  // （docs/perf.md §9），lastSolveSeconds 会退化成"某一个分量的切片"（约 1/3）。
+  // 累计值仍是各分量耗时之和 ⇒ 与历史同口径（都是"整趟的工作量"）。
+  std::printf("  单次回代 %.3f ms（累计 %.3f ms）\n",
+              st.totalSolveSeconds / std::max(1, st.solveCalls) * 1e3,
               st.totalSolveSeconds * 1e3);
   if (st.factorizeCalls > 0 && st.solveCalls > 0) {
     const double ratio = st.totalSolveSeconds / std::max(1e-12, st.totalFactorizeSeconds);
     std::printf("  收益提示: 本场景回代总耗时是分解的 %.2fx（分解只发生 %d 次）\n", ratio,
                 st.factorizeCalls);
   }
-  std::printf("  （注：Eigen 的稀疏三角求解是单线程，全局步不会随线程数加速）\n");
+  std::printf("  （注：三角求解本身仍是单线程；并行来自 L = Ã ⊗ I₃ 让 x/y/z 三个分量解耦，\n");
+  std::printf("    由 integrator 用 `omp for` 分给三条线程，见 docs/perf.md §9）\n");
   return 0;
 }

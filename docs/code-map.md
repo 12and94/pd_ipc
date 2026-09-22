@@ -132,6 +132,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | `_verify/chain_test.cpp` | 自由链/悬挂链与解析式对照 |
 | `_verify/direction_audit.cpp` | 投影方向三项判据（全局一致 / 物理合理 / 与标准 PD 逐位一致） |
 | `_verify/solve_audit.cpp` | **全局步求解器可行性审计**（`pd_solveaudit`）：延迟/带宽性质、因子层集与关键路径、换排序/分解的对照，以及"层调度并行回代"的原型（含正确性自证）。结论见 `docs/solver-feasibility.md`；**只测量，不改生产代码** |
+| `_verify/solve_components.cpp` | **全局步"按 x/y/z 三分量拆分"的验证与微基准**（`pd_solvecomp`）：① 结构自检（因子的分量块对角性、每分量 nnz 是否相等、跨分量填充必须为 0）；② "三分量分别求解"与"整趟求解"的**逐位比对**；③ 同一并行区域内交替测"整趟 / 三分量并行 / 三分量串行"。结论与前后对照见 `docs/perf.md` §9 |
 
 > **以下程序是排查期留下的，前提假设部分已过期，不是受支持的验收集**（见 `README.md` §4）：
 > `one_step_trace`、`standard_pd`、`steady`、`rhs_breakdown`、`force_audit`、`kappa_effect`、
@@ -158,7 +159,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 #   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 125 断言（16 个测试；含并行散射分支与约束着色的对照）
+.\build\Release\test_primitives.exe         # 130 断言（19 个测试；含并行散射分支、约束着色、全局步三分量拆分的对照）
 .\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
 .\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
 

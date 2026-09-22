@@ -50,6 +50,13 @@ void assembleInertialRhs(const Mesh& mesh, const std::vector<Vec3>& predicted,
 /// 覆盖 pinned 行：b 的对应分量置为 pin 位置。
 void applyPinRhs(const Mesh& mesh, Eigen::VectorXd& b);
 
+/// 只覆盖 pinned 行的**第 c 个分量**（配合全局步按 x/y/z 分量并行，见
+/// IGlobalSolver::parallelComponents）。`components == 1` 时等价于 applyPinRhs。
+///
+/// 为什么可以拆：pin 的三个分量互不相干（各写各的 3v+c），而 L 的每一块都是标量 × I₃
+/// ⇒ 分量之间内存完全不相交，可以由不同线程并发写同一向量 b 的不同位置。
+void applyPinRhsComponent(const Mesh& mesh, Eigen::VectorXd& b, int c, int components);
+
 /// 便捷封装：把 Eigen::VectorXd 解包成 Vec3 数组。
 void unpackPositions(const Eigen::VectorXd& x, std::vector<Vec3>& out);
 void packPositions(const std::vector<Vec3>& positions, Eigen::VectorXd& out);

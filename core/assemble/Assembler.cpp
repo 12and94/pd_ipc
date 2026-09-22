@@ -177,6 +177,21 @@ void applyPinRhs(const Mesh& mesh, Eigen::VectorXd& b) {
   }
 }
 
+void applyPinRhsComponent(const Mesh& mesh, Eigen::VectorXd& b, int c, int components) {
+  // components == 1：不分量，三个分量一起写（与 applyPinRhs 等价）。
+  // components == 3：只写 3v+c —— 不同 c 写的下标互不相交 ⇒ 可并发。
+  if (components <= 1) {
+    applyPinRhs(mesh, b);
+    return;
+  }
+  for (int v = 0; v < mesh.vertexCount(); ++v) {
+    if (!mesh.isPinned(v)) continue;
+    const Vec3& p = mesh.pinPositions[static_cast<std::size_t>(v)];
+    const Scalar d[3] = {p.x, p.y, p.z};
+    b[v * 3 + c] = d[c];
+  }
+}
+
 void unpackPositions(const Eigen::VectorXd& x, std::vector<Vec3>& out) {
   const int n = static_cast<int>(x.size() / 3);
   out.resize(static_cast<std::size_t>(n));

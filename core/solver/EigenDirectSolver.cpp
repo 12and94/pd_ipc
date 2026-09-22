@@ -31,9 +31,12 @@
 //      多读 0.8 MB（40×40）/ 39 MB（200×200）因子数据，把收益从 −23 % 压到 −10 %）。
 #include "core/solver/EigenDirectSolver.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace pd {
 
@@ -58,7 +61,69 @@ struct EigenDirectSolver::Impl {
   Eigen::VectorXd dinv;                 ///< 1/D，预计算：省掉每次 solve 的 n 次除法
   Eigen::VectorXd work;                 ///< 复用缓冲（置换后的右端 → 解）
   bool ready = false;
+
+  // ---- x/y/z 三分量（L = Ã ⊗ I₃）的拆分信息 ----
+  // 见 IGlobalSolver::parallelComponents 的完整说明。填不成 3 分量时 components 保持 1，
+  // 调用方自动退回整趟求解。
+  int components = 1;
+  std::vector<int> origOfPerm;            ///< 置换后列号 → 原索引
+  std::vector<std::vector<int>> compAsc;  ///< 每个分量的置换后列号（升序）
+  std::vector<std::vector<int>> compDesc; ///< 同上（降序；回代按降序扫列）
+
+  /// 在数值分解之后分析"能否按 3 个分量拆分"，并把列号表建好（一次性）。
+  void buildComponents();
 };
+
+void EigenDirectSolver::Impl::buildComponents() {
+  components = 1;
+  origOfPerm.clear();
+  compAsc.clear();
+  compDesc.clear();
+  if (n <= 0 || n % 3 != 0 || factor == nullptr) return;
+
+  // 置换后列号 → 原索引：把 P 作用在 label 向量上一次拿到。
+  // （Eigen 的置换索引语义容易记错，用数值探针是唯一不会写错的办法。）
+  Eigen::VectorXd labels(n);
+  for (int i = 0; i < n; ++i) labels[i] = static_cast<double>(i);
+  const Eigen::VectorXd mapped = P * labels;
+  origOfPerm.assign(static_cast<std::size_t>(n), 0);
+  for (int k = 0; k < n; ++k) {
+    origOfPerm[static_cast<std::size_t>(k)] = static_cast<int>(std::lround(mapped[k]));
+  }
+  {  // 自检：确实是一个置换（排序后应恰好是 0..n-1）
+    std::vector<int> sorted = origOfPerm;
+    std::sort(sorted.begin(), sorted.end());
+    for (int i = 0; i < n; ++i) {
+      if (sorted[static_cast<std::size_t>(i)] != i) return;
+    }
+  }
+
+  // 组建分量列号表（分量 c = 原索引 ≡ c (mod 3) 的那些列），并检查每个分量等大。
+  compAsc.assign(3, {});
+  for (int k = 0; k < n; ++k) {
+    const int c = origOfPerm[static_cast<std::size_t>(k)] % 3;
+    compAsc[static_cast<std::size_t>(c)].push_back(k);
+  }
+  for (int c = 0; c < 3; ++c) {
+    if (static_cast<int>(compAsc[static_cast<std::size_t>(c)].size()) != n / 3) return;
+  }
+
+  // 关键检查：填充不能跨分量。原因：L = Ã ⊗ I₃ ⇒ 它的图是 3 个互不相连的连通分量，
+  // 而消元只会"在某个分量的节点之间"生成填充 ⇒ 因子必然按分量块对角。
+  // 一旦将来引入各向异性/耦合 3×3 块的能量项，这里会命不中，components 自动保持 1。
+  for (int j = 0; j < n; ++j) {
+    const int cj = origOfPerm[static_cast<std::size_t>(j)] % 3;
+    for (CholMatrix::InnerIterator it(*factor, j); it; ++it) {
+      const int i = static_cast<int>(it.row());
+      if (i == j) continue;
+      if (origOfPerm[static_cast<std::size_t>(i)] % 3 != cj) return;
+    }
+  }
+
+  compDesc = compAsc;
+  for (auto& v : compDesc) std::reverse(v.begin(), v.end());
+  components = 3;
+}
 
 EigenDirectSolver::EigenDirectSolver() : impl_(std::make_unique<Impl>()) {}
 EigenDirectSolver::~EigenDirectSolver() = default;
@@ -110,8 +175,12 @@ void EigenDirectSolver::factorize(const Eigen::SparseMatrix<Scalar>& L) {
     impl_->dinv = impl_->solver.vectorD().cwiseInverse();
     impl_->work.resize(impl_->n);
     impl_->ready = true;
+    // 数值分解之后才知道因子结构 ⇒ 在这里做一次"能否按 x/y/z 三分量拆分"的分析
+    // （一次性 O(nnz)；失败就保持 1 个分量，调用方退回整趟求解）。
+    impl_->buildComponents();
   } else {
     impl_->ready = false;
+    impl_->components = 1;
     std::fprintf(stderr,
                  "[EigenDirectSolver] 数值分解失败（LDLᵀ info != Success）——矩阵可能不是正定的，"
                  "或者结构与 analyzePattern 时不一致。\n");
@@ -180,6 +249,95 @@ void EigenDirectSolver::solve(const Eigen::VectorXd& b, Eigen::VectorXd& x) {
   x.noalias() = impl_->Pinv * impl_->work;
 
   stats_.solveCalls += 1;
+  stats_.lastSolveSeconds = secondsSince(t0);
+  stats_.totalSolveSeconds += stats_.lastSolveSeconds;
+}
+
+int EigenDirectSolver::parallelComponents() const { return impl_->components; }
+
+void EigenDirectSolver::solveComponent(int c, const Eigen::VectorXd& b, Eigen::VectorXd& x) {
+  // 结构不满足（不是 Ã ⊗ I₃）时不拆分：转回整趟求解，行为与改动前完全一致。
+  if (impl_->components <= 1) {
+    if (c != 0) {
+      std::fprintf(stderr, "[EigenDirectSolver::solveComponent] 分量号越界：c=%d，但只有 1 个分量。\n",
+                   c);
+      std::fflush(stderr);
+      std::abort();
+    }
+    solve(b, x);
+    return;
+  }
+
+  const auto t0 = Clock::now();
+  const int n = impl_->n;
+  const char* kPre = "[EigenDirectSolver::solveComponent] 违反前置条件";
+
+  if (!impl_->ready) {
+    std::fprintf(stderr, "%s：尚未完成数值分解（或分解失败）。\n", kPre);
+    std::fflush(stderr);
+    std::abort();
+  }
+  if (c < 0 || c >= impl_->components) {
+    std::fprintf(stderr, "%s：分量号越界（c=%d，共 %d 个分量）。\n", kPre, c, impl_->components);
+    std::fflush(stderr);
+    std::abort();
+  }
+  if (b.size() != n) {
+    std::fprintf(stderr, "%s：右端维度不匹配（b %lld，期望 %d）。\n", kPre,
+                 static_cast<long long>(b.size()), n);
+    std::fflush(stderr);
+    std::abort();
+  }
+  // 拆分路径**刻意不 resize**：多线程下并发 resize 同一个向量是竞争。
+  // 调用方（stepOnce）在进并行区域之前就把 xSolution 备成了长度 n。
+  if (x.size() != n) {
+    std::fprintf(stderr, "%s：拆分求解要求 x 已经是长度 %d（实际 %lld）—— 请调用方先备好。\n", kPre,
+                 n, static_cast<long long>(x.size()));
+    std::fflush(stderr);
+    std::abort();
+  }
+
+  const std::vector<int>& ac = impl_->compAsc[static_cast<std::size_t>(c)];
+  const std::vector<int>& de = impl_->compDesc[static_cast<std::size_t>(c)];
+  const int* o = impl_->origOfPerm.data();
+  double* w = impl_->work.data();
+  const Impl::CholMatrix& F = *impl_->factor;
+
+  // 下面的三趟循环与 solve() 里逐行对应，唯一区别是"只遍历本分量的列"。
+  // 因为分量之间内存完全不相交、且列顺序（升序 / 降序）与整趟一致，所以
+  // 每个分量的算术序列与整趟**逐位相同** —— 这是本改造最重要的性质
+  // （tests/primitives 里有"三分量之和 == 整趟"的逐位断言；pd_solvecomp 也钉住了它）。
+  for (int k : ac) w[k] = b[o[k]];  // work = P·b（只取本分量）
+  for (int j : ac) {                // 前代 L·y = work（scatter 形式，见文件头要点 1）
+    const Scalar yj = w[j];
+    for (Impl::CholMatrix::InnerIterator it(F, j); it; ++it) {
+      const int i = static_cast<int>(it.row());
+      if (i > j) {
+        w[i] -= it.value() * yj;
+      }
+    }
+  }
+  for (int j : ac) {  // 对角缩放 z = y / D
+    w[j] *= impl_->dinv[static_cast<Eigen::Index>(j)];
+  }
+  for (int j : de) {  // 回代 Lᵀ·x = z（扫 CSC 第 j 列取 i>j 的项）
+    Scalar s = w[j];
+    for (Impl::CholMatrix::InnerIterator it(F, j); it; ++it) {
+      const int i = static_cast<int>(it.row());
+      if (i > j) {
+        s -= it.value() * w[i];
+      }
+    }
+    w[j] = s;
+  }
+  for (int k : ac) x[o[k]] = w[k];  // x = P⁻¹·y（只写本分量）
+
+  // 统计口径：`solveCalls` 只在分量 0 的那次调用上自增 ⇒ 仍然等于"全局步次数"，
+  // 与改动前（每次 solve 一次）以及 tests/bench 的口径一致。
+  // `totalSolveSeconds` 累加每个分量自己的耗时 ⇒ 仍近似等于"整趟串行的工作量"，
+  // 因此"累计回代耗时 / 回代次数"这个比值仍与历史可比。
+  // 注意 `lastSolveSeconds` 在拆分时是**单个分量的切片**（约为整趟的 1/3）。
+  if (c == 0) stats_.solveCalls += 1;
   stats_.lastSolveSeconds = secondsSince(t0);
   stats_.totalSolveSeconds += stats_.lastSolveSeconds;
 }
