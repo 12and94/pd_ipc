@@ -1144,7 +1144,8 @@ Remove-Item Env:\PD_DEBUG_RESIDUAL
 #   $b=[IO.File]::ReadAllBytes("build\Release\pd_bench.exe"); ([regex]::Matches([Text.Encoding]::ASCII.GetString($b),'libomp')).Count
 
 # 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3/4c/4d A/B
-#   + §八 剪切 / §九 弯曲 / §十 采样变体 / §十一 惯性右端（已否）+ 查看器时间线）
+#   + §八 剪切 / §九 弯曲 / §十 四套约束集的阶段构成 / §十一 采样变体 / §十二 惯性右端（已否）
+#   + 查看器时间线）
 node build\_perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
 node build\_perf\check_report.js          # 几何 + 新板块自检（用 DOM 桩真跑一遍渲染代码）
 node build\_perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
@@ -1172,13 +1173,16 @@ node build\_perf\serve.js                # 可选：静态服务，浏览器开 
 # 弯曲 stencil 采样变体（§13）的降本对照：off / 全采样 / 单向 / 棋盘 / 隔行 × 刚度补偿
 .\build\_perf\ab_bend_variants.ps1 -Reps 5          # 日志：build\_baseline\bend_variants_ab.log
 
+# 四套约束集的阶段构成（看板 §十）：默认 / 只剪切 / 只弯曲 / 两者都开
+.\build\_perf\constraint_sets.ps1 -Reps 3           # 日志：build\_perf\logs_cs\（原样 pd_bench 输出）
+
 # 惯性右端并行化（§14）的三方 A/B：旧-single / 控制-single / 新-for（7 次交替取最小）
 #   ⚠ 源码已回退 ⇒ 现在跑它两端是同一份代码（差值应 ≈ 0）；要重做实验先把 §14 那几行改回去
 .\build\_perf\ab_inertial.ps1 -Reps 7               # 日志：build\_baseline\inertial_ab3.log
 
-# Phase 4c 的看板数据刷新（① 线程扫描日志 ② phase4c_ab.log ③ 剪切/弯曲/采样变体的 A/B 日志）
+# Phase 4c 的看板数据刷新（① 线程扫描 ② phase4c A/B ③ 剪切/弯曲/采样变体 A/B ④ 四套约束集）
 #   → 重生成 → 自检 → 起静态服务
-.\build\_perf\refresh_report.ps1            # 约 5 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
+.\build\_perf\refresh_report.ps1            # 约 6 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
 node build\_perf\make_report.js             # 生成 build\_perf\perf-report.html
 node build\_perf\check_report.js            # 自检（段数 / 越界 / 标尺文本 + 新板块非空与关键数字反查）
 node build\_perf\serve.js                   # http://127.0.0.1:8137/
@@ -1187,11 +1191,23 @@ node build\_perf\serve.js                   # http://127.0.0.1:8137/
 > **看板各板块的数据来源**（改脚本时这几对数不能脱钩）：
 > §五/§六/§七 ← `phase3_ab.log` / `phase4c_ab.log` / `phase4d_ab.log`（固定列格式，`parsePhase3`）；
 > §八 ← `shear_ab.log`（`ab_shear.ps1`）；§九 ← `bend_ab.log`（`ab_bend.ps1`）；
-> §十 ← `bend_variants_ab.log`（`ab_bend_variants.ps1`，"多配置 × 多档"格式，`parseVariants`）；
-> §十一 ← `inertial_ab3.log`（三方对照，需 `build/_baseline/pd_bench_ctrl_single.exe` 这个控制组二进制
+> §十 ← `build/_perf/logs_cs/<工况>__<配置>_r<N>.txt`（`constraint_sets.ps1`；原样 pd_bench 输出，
+> 直接用 `parseBench`，再配 `logMeta` 取 L nnz / 因子 nnz / stencil 数）；
+> §十一 ← `bend_variants_ab.log`（`ab_bend_variants.ps1`，"多配置 × 多档"格式，`parseVariants`）；
+> §十二 ← `inertial_ab3.log`（三方对照，需 `build/_baseline/pd_bench_ctrl_single.exe` 这个控制组二进制
 > —— 用 `#if 0` 把实验开关关掉再构建一次即可；**实验源码已回退**，见 §14）。
 > 两张"两值对照"表（§八/§九）由 `parseTwoWay` 解析；**解析口径**：绝对数列一律取
 > `单子步 x ms` 字段本身，不要"取行里第一个 x.y"（那是 `总耗时` 的秒数，见 §12.4）。
+
+> **§十 的结论（2026-09-23 实测，3 工况 × 4 套 × 3 次取最小）**：
+> ① 只加剪切 ⇒ 时间主要进 `投影+散射`（+19 %/+21 %/+31 % 总代价，其中投影+散射是主项）；
+> ② 只加弯曲 ⇒ 回代涨 **2.0× / 2.4× / 5.9×**（40×40 / 60×60 / 100×100），
+>    `投影+散射` 在小组上几乎不动（+2 %/+7 %）、在 100×100 上也会涨 61 %（整条迭代的访存压力变大）；
+> ③ **反直觉但确定**：「剪切 + 弯曲」的 `L` 非零比"只加弯曲"更多（+22 %），
+>    但**因子 nnz 反而更少**（−6.8 % / −6.1 % / −9.3 %）⇒ 100×100 上它比"只加弯曲"**还快**
+>    （19.9 vs 26.0 ms/子步）。**填充量不是约束数的单调函数**：它由"消元顺序 + 整体结构"共同决定，
+>    加剪切改动了 AMD 给出的排序，而新排序对弯曲那部分结构恰好更省填充。
+>    ⇒ 这也提示一条没做过的机会：**给含弯曲的矩阵找一个更好的排序**（本项目只试过 AMD + 自然序）。
 
 > **每次触及热路径的改动都要在本文件补"前后对照"**（`docs/contributing.md` §6），
 > 并在提交信息里附上同一轮会话的成对数字。
