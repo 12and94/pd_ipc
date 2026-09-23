@@ -29,8 +29,10 @@ using namespace pd;
 namespace {
 
 int g_failed = 0;
+int g_total = 0;   // 断言总数：打印出来，免得文档里的"项数"各说各话（曾经有 12 项 / 9 条 / 22 条三种说法）
 
 void item(const char* name, bool ok, double got, double want, double tol) {
+  ++g_total;
   std::printf("  %-46s %s   got=%.6e want=%.6e tol=%.1e\n", name, ok ? "OK" : "NG", got, want, tol);
   if (!ok) ++g_failed;
 }
@@ -480,6 +482,7 @@ int main() {
                 "     网格越细，同一个 k 越软 ⇒ 必须**调大** k。文档原先写的「∝ s⁴/k」方向与幂次都不对。\n");
   }
 
-  std::printf("\n  %s（失败 %d 项）\n", g_failed == 0 ? "全部正确" : "存在错误", g_failed);
+  std::printf("\n  %s（断言 %d 条，失败 %d 项）\n", g_failed == 0 ? "全部正确" : "存在错误", g_total,
+              g_failed);
   return g_failed == 0 ? 0 : 1;
 }

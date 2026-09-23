@@ -596,6 +596,9 @@ scatter 对 1–40 MB 数据的访问，因子是**冷的**）它要多读一整
 | 200×200 / iters 10 / 4T（仅 12 子步） | 75.549 ms | 51.684 ms | **−31.6 %** | 677.9 ms | 379.7 ms | −44.0 % |
 
 - 主工况从 **4.966 → 2.867 ms/子步**；相对本文件 §1 记录的改造前基线（18T 13.865 ms），累计 **4.8×**。
+- ⚠️ **绝对值只在同一小节内可比**：本表 100×100 的 4.764 ms 与 §10.2 表里的 6.226 → 5.697 ms 来自
+  **不同会话**，5.697 > 4.764 **不代表 Phase 4d 变慢**（4d 只可能更快）—— 那是跨会话漂移（本文件 §0 的纪律）。
+  引用绝对 ms 时请连会话一起引；相对百分比在同一小节内是自洽的。
 - **上表是第一轮测量**。看板用的是 `build/_perf/refresh_report.ps1` 生成的**第二轮**（同轮会话内交替 5 次
   取最小；与第一轮差 0.5 个百分点以内，属噪声）：40×40/4T **4.997 → 2.910（−41.8 %）**、
   18T 7.257 → 4.097（−43.5 %）、交互档 0.663 → 0.385（−41.9 %）、100×100 11.714 → 5.969（−49.0 %）、
@@ -679,6 +682,9 @@ inline void scatterEdgeValue(const Mesh&, const Edge&, const Vec3& d, Scalar* ou
 收益（−3…−14 %）远大于原先"粗估 3–8 %"的估计 —— 大头来自 `targets` 的写 + 读与位置数组的
 重复读取（在 40×40 上 `targets` 是 75 KB，已经装不进 L1）。大规模上收益递减，因为那一档
 主要是访存受限。
+
+> ⚠️ 本表（§10.2）与 §9.4 的 100×100 绝对值（6.226 / 5.697 vs 4.764）**来自不同会话**，
+> 不能并列读成趋势 —— 两处都已加注，见 §9.4 的说明。相对百分比（如本表的 −8.5 %）是同一会话内的。
 
 **阶段构成随之变化（40×40/iters40/4T，累计 ms/占比）**：全局回代 **528.6 / 65.4 %**、
 解包+判据 170.3 / 21.1 %、**投影+散射 89.7 / 11.1 %**、其它 2.4 %。
@@ -858,7 +864,7 @@ f_v = Σ_{stencil 含 v}  -k·w_v·(x_a - 2 x_b + x_c)
 | `pd_check` 8/8 | 全过 |
 | `test_primitives` / `test_spring_vertical` / `test_convergence_criterion` | **350 断言**（primitives 由 136 增至 180，+44 条弯曲断言），0 失败。§13 又加了采样变体断言 ⇒ 现为 **233 + 155 + 15 = 403** |
 | `pd_trans` / `pd_chain` / `pd_diraudit` | 全过 |
-| `pd_bendaudit`（新） | 全部正确（12 项） |
+| `pd_bendaudit`（新） | 全部正确（**断言 22 条**，其中 H 节尺度律 11 条；程序末行自打总数） |
 | **默认关闭（`PD_BEND` 未设）与 `build/_baseline/pd_bench_pre_fuse.exe` 逐字比对** | **True**（收敛统计、末次残差 8.63991 m/s²、最终应变 0.0585735/0.0013502、全程最大应变 0.0652267、弹性能 0.322049、总能量 −10.5941 全部逐字相同） |
 | **启用弯曲时跨线程数逐字一致**（1/2/3/4/5/8/18 线程，40×40/iters20/60 子步/`PD_BEND=1000`） | **7/7 全部逐字相同** |
 | `pd_solvecomp --grid 40 40 --reps 50 --threads 4`（**默认约束集**） | 跨分量 i≠j 项 **0**；"三分量拆 vs 整趟"最大逐元素差 **0.000e+00** |
@@ -1036,7 +1042,7 @@ stencil 变少 ⇒ `L = Ã ⊗ I₃`、只分解一次、三分量并行回代�
 
 | 检查 | 结果 |
 |---|---|
-| `pd_check` / `pd_bendaudit` / `pd_trans` / `pd_chain` / `pd_diraudit` / `pd_solvecomp` | 全过（`pd_bendaudit` 12/12；`pd_solvecomp` 跨分量 i≠j = 0、拆分 vs 整趟逐位差 0.000e+00） |
+| `pd_check` / `pd_bendaudit` / `pd_trans` / `pd_chain` / `pd_diraudit` / `pd_solvecomp` | 全过（`pd_bendaudit` **断言 22 条**全 OK；`pd_solvecomp` 跨分量 i≠j = 0、拆分 vs 整趟逐位差 0.000e+00） |
 | 断言总数 | **233 + 155 + 15 = 403**，0 失败（primitives 由 180 增至 233，+53：采样变体 + 退化反例） |
 | 默认关闭 vs `pd_bench_pre_fuse.exe` | **逐字相同**（残差 89.3655、应变 0.0640233/0.0018079、全程峰值 0.0652267、弹性能 0.419269、总能量 −6.30461） |
 | 采样变体的逐线程决定性 | `rows/1`、`checker/1`、`standard/2` 在 1/2/3/4/5/8/18 线程下各 **7/7 逐位相同** |
@@ -1138,10 +1144,11 @@ cd D:\dsh_workspace\pd_ipc ; .\tools\build.ps1
 .\build\Release\pd_bench.exe --grid 60 60 --steps 300 --iters 2 --residual-tol 0.3
 .\build\Release\pd_viewer.exe --frames 400
 
-# 正确性与确定性（含着色的结构/确定性断言、跨线程位级一致）
+# 正确性与确定性（含着色的结构/确定性断言、跨线程位级一致；弯曲专项审计也在这一组）
 .\build\Release\pd_check.exe ; .\build\Release\test_primitives.exe
 .\build\Release\test_spring_vertical.exe ; .\build\Release\test_convergence_criterion.exe
 .\build\Release\pd_trans.exe ; .\build\Release\pd_chain.exe ; .\build\Release\pd_diraudit.exe
+.\build\Release\pd_bendaudit.exe        # 弯曲代数审计 + H 节尺度律（断言 22 条，末行自打总数）
 
 # Phase 3 的两口径自查：PD_DEBUG_RESIDUAL=1 时串行/并行两条残差都算并互相比对（>1e-9 告警）
 $env:PD_DEBUG_RESIDUAL='1'
