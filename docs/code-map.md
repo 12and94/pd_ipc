@@ -134,7 +134,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 | `_verify/direction_audit.cpp` | 投影方向三项判据（全局一致 / 物理合理 / 与标准 PD 逐位一致） |
 | `_verify/solve_audit.cpp` | **全局步求解器可行性审计**（`pd_solveaudit`）：延迟/带宽性质、因子层集与关键路径、换排序/分解的对照，以及"层调度并行回代"的原型（含正确性自证）。结论见 `docs/solver-feasibility.md`；**只测量，不改生产代码** |
 | `_verify/solve_components.cpp` | **全局步"按 x/y/z 三分量拆分"的验证与微基准**（`pd_solvecomp`）：① 结构自检（因子的分量块对角性、每分量 nnz 是否相等、跨分量填充必须为 0）；② "三分量分别求解"与"整趟求解"的**逐位比对**；③ 同一并行区域内交替测"整趟 / 三分量并行 / 三分量串行"。结论与前后对照见 `docs/perf.md` §9 |
-| `_verify/bend_audit.cpp` | **线性（中点）弯曲约束的代数审计**（`pd_bendaudit`）：求解器对角自检、三条链的隐式欧拉解析解（$y=\hat y\,(m/h^2)/(m/h^2+4k)$）、线性残差 $|Lx-b|$ 到机器精度、"pinned 行必须精确为单位行"、平直位形零弯曲力、弯曲力与 $-\nabla E$ 的有限差分一致、跨 x/y/z 分量填充必须为 0。**它抓到的正是"弯曲的装配规则不能照抄距离约束的跳过规则"这个坑**（见 `docs/perf.md` §12.6 局限 5） |
+| `_verify/bend_audit.cpp` | **线性（中点）弯曲约束的代数审计**（`pd_bendaudit`）：求解器对角自检、三条链的隐式欧拉解析解（$y=\hat y\,(m/h^2)/(m/h^2+4k)$）、线性残差 $|Lx-b|$ 到机器精度、"pinned 行必须精确为单位行"、平直位形零弯曲力、弯曲力与 $-\nabla E$ 的有限差分一致、跨 x/y/z 分量填充必须为 0、**以及 H 节：等效抗弯刚度的尺度律**（给定抛物线形状直接算能量 ⇒ 二维板 `D_eff = k·s²·N(N−2)/(N−1)²`、一维纤维 `∝ k·s³`、对 k 严格线性；9 条断言）。**它抓到的正是"弯曲的装配规则不能照抄距离约束的跳过规则"这个坑**（见 `docs/perf.md` §12.6 局限 5） |
 
 > **以下程序是排查期留下的，前提假设部分已过期，不是受支持的验收集**（见 `README.md` §4）：
 > `one_step_trace`、`standard_pd`、`steady`、`rhs_breakdown`、`force_audit`、`kappa_effect`、
@@ -161,10 +161,10 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 #   4 pinned 顶点严格不动         8 弹性力符号 == -dU/dy
 
 # ---- 测试套件（打印每条断言）----
-.\build\Release\test_primitives.exe         # 180 断言（26 个测试；含并行散射、约束着色、全局步三分量拆分、投影+散射融合、剪切对角边、**线性中点弯曲**）
+.\build\Release\test_primitives.exe         # 233 断言（27 个测试；含并行散射、约束着色、全局步三分量拆分、投影+散射融合、剪切对角边、**线性中点弯曲**与它的采样变体/退化反例）
 .\build\Release\test_spring_vertical.exe    # 155 断言（11 个测试）
 .\build\Release\test_convergence_criterion.exe  # 15 断言（4 个测试，收敛判据与外层迭代质量）
-# 合计 350 断言
+# 合计 403 断言
 
 # ---- 专项验证 ----
 .\build\Release\pd_diraudit.exe       # 投影方向：全局一致性 / 物理合理性 / 标准 PD 一致性
@@ -202,10 +202,16 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 查看器参数：`--grid N` 网格边长、`--stiffness K` 刚度（默认 2300）、`--frames N` 跑够帧数自动退出、
 `--shot FILE.png` 截图（自写 PNG 编码，无图像库依赖）、`--pin-single` 只钉顶边中点、`--pin-corners` 只钉两角（默认钉整条上边）、`--iters N` `--damping K` `--dt H`、
+**`--size W H` / `--pos X Y`（窗口尺寸与屏幕位置；同时开几个查看器做配置对照时用）**、
 **`--residual-tol T`（真正的放行门槛，默认 0.3；`<=0` 禁用并回退到位移判据 `--tol T`）**、
 `--no-early-exit`（关掉全部提前退出，优先级最高）。
 窗口内交互：左键拖拽旋转 / 滚轮缩放 / `SPACE` 暂停 / `S` 单步 / `G` 重力 / `R` 重置 /
 `[` `]` 刚度 / `-` `=` 迭代数 / `,` `.` 子步 / `;` `'` 线程数 / `ESC` 退出。
+
+**⚠️ HUD 只有数字**：HUD 是自绘的**七段数码管**（`drawDigit`），**不画字母** —— 所以
+`FPS/FRAME/PHYS` 这些标签其实不显示，配置信息也不放 HUD。**当前配置写在窗口标题里**
+（系统字体渲染，例如 `PD cloth 60x60 stiffness 500 corners 1 | BEND k=1000 standard/s2 (stencils 3480) | shear off`），
+同时开多个窗口做对照时靠标题区分。
 
 **实测**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束），`--frames 600` 平均
 **59.4 FPS**（vsync 封顶 60）、稳态物理 **1.52 ms/帧**、迭代 1 次、全程数值分解 1 次。
@@ -245,7 +251,7 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 | `pd_trans` | 平移一致性：pin 在任意位置下静止位移严格为 0；平移系统后相对形状不变 | 全过 |
 | `pd_chain` | 长链条对照解析解：自由链长度精确不变；悬挂链伸长与 $mg\,N(N-1)/(2\kappa)$ 吻合 | 全过 |
 | `pd_diraudit` | 方向三项：全局一致 / 物理合理 / 与标准 PD 逐位一致 | 全过 |
-| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | **180** + 155 + 15 = **350 断言** | 全绿 |
+| `test_primitives` + `test_spring_vertical` + `test_convergence_criterion` | **233** + 155 + 15 = **403 断言** | 全绿 |
 
 **实测性能**（i7-12700F，18 线程）：60×60 布料（3600 顶点 / 7080 约束）
 查看器 `--frames 400` 实测 60 FPS（vsync 封顶）、稳态物理 1.9 ms/帧、迭代 1 次、
@@ -269,7 +275,9 @@ $env:PD_CHECK_VERBOSE = "1"   # pd_check 第 8 项打印逐点明细
 3. **刚度标定未最终确定**：$\kappa$ 与顶点质量的量级需按目标网格配好，
    否则布料在自重下会明显伸长。正确做法是把刚度按质量参数化（$\kappa=k_{\rm mat}\cdot m$），
    而不是按长度（曾经按 $\mathrm{spacing}^2$ 缩放过，是错的，已撤掉）。
-   弯曲刚度同理且更严重：它的等效抗弯刚度 $\propto s^4/k$，换网格必须重新标定。
+   弯曲刚度同理且更严重：它的等效抗弯刚度**实测 `∝ k·s²`**（二维板；`pd_bendaudit` H 节，
+   给定形状直接算能量的确定性测量）⇒ 换网格必须按 **`k ∝ 1/s²`** 重新标定。
+   （旧文档写的 `∝ s⁴/k` 是错的，2026-09-23 已改。）
 
 **文档注意**：`README.md` 与 `docs/plan.md` 里关于"重力只出现在预测里"的结论是对的，
 早期文档曾写过"右端要补 $-Mg$"，那**是错的**（等于把重力算两遍），已全部更正。

@@ -336,6 +336,150 @@ int main() {
     item("G  线性残差 |Lx-b|∞/|b|∞", lr < 1e-12, lr, 0.0, 1e-12);
   }
 
+  // ---- H：尺度律：等效抗弯刚度对"网格间距 s"与"刚度 k"的幂次 ----
+  //
+  // 为什么需要它：文档里曾有 8 处写"等效抗弯刚度 ∝ s⁴/k"。那个写法**对 k 的关系是反的**
+  // （k 越大当然越硬），幂次也可疑。这里用**确定性**的办法把它测准 —— 不跑迭代、不涉及时间：
+  //
+  //   ① 给一块**物理尺寸固定**的布（L×L）一个**给定的光滑形状** φ(x,y) = δ·(x/L)²；
+  //      它的二阶导 φ_xx = 2δ/L² 是常数 ⇒ 二阶差分对它是**精确**的，没有离散化误差。
+  //   ② 直接算弯曲能 E = (k/2)·Σ_c ‖A_c φ‖²（行、列两向 stencil 都算）。
+  //   ③ 由连续板能量 E_cont = (D/2)·∫(φ_xx² + φ_yy²)dA 反解"等效抗弯刚度"
+  //        D_eff = 2E / ∫(φ_xx² + φ_yy²)dA = 2E / (4δ²/L²)
+  //   ④ 只改分辨率（N，s = L/(N−1)）或只改 k，看 D_eff 怎么变。
+  //
+  // 解析预期（同一套离散，可精确推导）：E = (k·s⁴/2)·(N−2)·N·φ_xx²
+  //   ⇒ D_eff = k·s²·N(N−2)/(N−1)²  ≈  k·s²
+  //   ⇒ **D_eff ∝ k·s²**（二维板，每单位面积）：k 越大越硬（线性）；**网格越细越软**，
+  //      要保持同样的手感必须 **k ∝ 1/s²** —— 与文档原写的 `s⁴/k` 方向相反、幂次也不同。
+  {
+    std::printf("\n[H] 尺度律：等效抗弯刚度 D_eff 对 s / k 的幂次（给定形状直接算能量）\n");
+    const double L = 1.0;
+    const double delta = 0.1;
+    const double phiXX = 2.0 * delta / (L * L);
+    const double integral2D = phiXX * phiXX * L * L;   // ∫(φ_xx² + φ_yy²)dA（φ_yy = 0）
+
+    // 二维板：给定 φ(x,y)=δ(x/L)²，返回 D_eff = 2E/∫(…)
+    auto measureSheet = [&](int N, Scalar k) -> double {
+      const double s = L / (N - 1);
+      Mesh m = Mesh::makeGrid(N, N, static_cast<Scalar>(s));
+      m.addBendingStencils(N, N, k);   // 行、列都加（Standard）
+      for (int j = 0; j < N; ++j) {
+        for (int i = 0; i < N; ++i) {
+          const double x = i * s;
+          const double phi = delta * (x / L) * (x / L);
+          m.positions[static_cast<std::size_t>(j * N + i)] = Vec3{x, static_cast<Scalar>(phi), 0.0};
+        }
+      }
+      double energy = 0.0;
+      for (const BendStencil& st : m.bends) {
+        const Vec3 second = m.positions[static_cast<std::size_t>(st.a)] -
+                            m.positions[static_cast<std::size_t>(st.b)] * 2.0 +
+                            m.positions[static_cast<std::size_t>(st.c)];
+        const double sq = static_cast<double>(second.x) * second.x +
+                          static_cast<double>(second.y) * second.y +
+                          static_cast<double>(second.z) * second.z;
+        energy += 0.5 * static_cast<double>(st.stiffness) * sq;
+      }
+      return 2.0 * energy / integral2D;
+    };
+
+    // 一维纤维（单行、手工搭链）：返回 EI_eff = 2E/∫φ''²dx
+    // ⚠️ 这里**不能**用 `Mesh::makeGrid(N, 1, s)`：`makeGrid` 在 `ny < 2` 时直接返回**空网格**
+    //    （Mesh.cpp:14），接着按 N 写 positions 就是越界写（实测 0xC0000005）。
+    auto measureFiber = [&](int N, Scalar k) -> double {
+      const double s = L / (N - 1);
+      Mesh m;
+      m.positions.resize(static_cast<std::size_t>(N));
+      m.restPositions.resize(static_cast<std::size_t>(N));
+      m.velocities.assign(static_cast<std::size_t>(N), Vec3{});
+      m.masses.assign(static_cast<std::size_t>(N), 1.0);
+      m.pinned.assign(static_cast<std::size_t>(N), 0);
+      m.pinPositions.resize(static_cast<std::size_t>(N));
+      for (int i = 0; i < N; ++i) {
+        const double x = i * s;
+        const double phi = delta * (x / L) * (x / L);
+        m.positions[static_cast<std::size_t>(i)] = Vec3{x, static_cast<Scalar>(phi), 0.0};
+        m.restPositions[static_cast<std::size_t>(i)] = Vec3{x, 0.0, 0.0};
+      }
+      for (int i = 1; i + 1 < N; ++i) {
+        BendStencil st;
+        st.a = i - 1;
+        st.b = i;
+        st.c = i + 1;
+        st.stiffness = k;
+        m.bends.push_back(st);
+      }
+      m.buildSparsityPattern();
+      double energy = 0.0;
+      for (const BendStencil& st : m.bends) {
+        const Vec3 second = m.positions[static_cast<std::size_t>(st.a)] -
+                            m.positions[static_cast<std::size_t>(st.b)] * 2.0 +
+                            m.positions[static_cast<std::size_t>(st.c)];
+        const double sq = static_cast<double>(second.x) * second.x +
+                          static_cast<double>(second.y) * second.y +
+                          static_cast<double>(second.z) * second.z;
+        energy += 0.5 * static_cast<double>(st.stiffness) * sq;
+      }
+      return 2.0 * energy / (phiXX * phiXX * L);
+    };
+
+    const Scalar k0 = 1000.0;
+    std::printf("  %-6s %-11s %-15s %-20s %-10s\n", "N", "s", "D_eff(二维板)", "D_eff/(k·s²)", "拟合幂次");
+    double prev = 0.0, prevS = 1.0;
+    const int ns[] = {8, 16, 32, 64};
+    for (int N : ns) {
+      const double s = L / (N - 1);
+      const double d = measureSheet(N, k0);
+      const double ratio = d / (static_cast<double>(k0) * s * s);
+      char expo[32] = "-";
+      if (prev > 0.0) {
+        const double p = std::log(d / prev) / std::log(s / prevS);
+        std::snprintf(expo, sizeof(expo), "%.4f", p);
+      }
+      std::printf("  %-6d %-11.6f %-15.6e %-20.6f %-10s\n", N, s, d, ratio, expo);
+      prev = d;
+      prevS = s;
+    }
+    // 断言 1：与解析式 D_eff = k·s²·N(N−2)/(N−1)² 逐位吻合（抛物线的二阶差分是精确的）
+    for (int N : ns) {
+      const double s = L / (N - 1);
+      const double want = static_cast<double>(k0) * s * s * N * (N - 2) / ((N - 1.0) * (N - 1.0));
+      char name[80];
+      std::snprintf(name, sizeof(name), "H  二维板 N=%d 与解析式一致", N);
+      const double got = measureSheet(N, k0);
+      item(name, std::fabs(got - want) <= 1e-12 * std::fabs(want), got, want, 1e-12);
+    }
+    // 断言 2：对 k 线性（k 加倍 ⇒ D_eff 加倍）
+    {
+      const double a = measureSheet(16, k0), b2 = measureSheet(16, 2.0 * k0);
+      item("H  对 k 线性（2k ⇒ 2×D_eff）", std::fabs(b2 / a - 2.0) < 1e-12, b2 / a, 2.0, 1e-12);
+    }
+    // 断言 3：拟合幂次的**渐近值**（二维 2 / 一维 3）。容差放到 0.05：
+    //   有限 N 下拟合值带一个 O(1/N) 偏置 —— 例如一维的精确式是 EI = k·s³·(N−2)/(N−1)，
+    //   在 N=16→64 上拟合出 2.963 而不是 3.000（解析可算，见断言 4），这不是误差。
+    {
+      const double s1 = L / 15.0, s2 = L / 63.0;
+      const double p2 = std::log(measureSheet(64, k0) / measureSheet(16, k0)) / std::log(s2 / s1);
+      const double p1 = std::log(measureFiber(64, k0) / measureFiber(16, k0)) / std::log(s2 / s1);
+      item("H  二维板拟合幂次 ≈ 2（渐近）", std::fabs(p2 - 2.0) < 0.05, p2, 2.0, 0.05);
+      item("H  一维纤维拟合幂次 ≈ 3（渐近）", std::fabs(p1 - 3.0) < 0.05, p1, 3.0, 0.05);
+    }
+    // 断言 4：与**精确离散公式**逐位吻合（比"拟合幂次"强得多）：
+    //   二维板 D_eff = k·s²·N(N−2)/(N−1)²；一维纤维 EI_eff = k·s³·(N−2)/(N−1)。
+    for (int N : ns) {
+      const double s = L / (N - 1);
+      const double wantF = static_cast<double>(k0) * s * s * s * (N - 2) / (N - 1.0);
+      char name[80];
+      std::snprintf(name, sizeof(name), "H  一维纤维 N=%d 与解析式一致", N);
+      const double gotF = measureFiber(N, k0);
+      item(name, std::fabs(gotF - wantF) <= 1e-12 * std::fabs(wantF), gotF, wantF, 1e-12);
+    }
+    std::printf("  ⇒ 结论：等效抗弯刚度 ∝ **k·s²**（二维板，每单位面积）—— 对 k **线性**（不是倒数！）；\n"
+                "     一维纤维 ∝ **k·s³**。保持同样手感需要 **k ∝ 1/s²**（二维板）：\n"
+                "     网格越细，同一个 k 越软 ⇒ 必须**调大** k。文档原先写的「∝ s⁴/k」方向与幂次都不对。\n");
+  }
+
   std::printf("\n  %s（失败 %d 项）\n", g_failed == 0 ? "全部正确" : "存在错误", g_failed);
   return g_failed == 0 ? 0 : 1;
 }
