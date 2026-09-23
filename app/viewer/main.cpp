@@ -9,6 +9,7 @@
 //   左键拖拽平移相机 / 右键或滚轮缩放 / R 重置 / SPACE 暂停 / 单步 S / 重力 G
 //   刚度 [ ] / 迭代数 - = / 子步数 , . / 线程数 ; ' / ESC 退出
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -373,6 +374,9 @@ void drawHud(const SimContext& ctx, const Interactive& st, int width, int height
   glEnd();
   y -= 16.0f;
 
+  // 弯曲/剪切配置**不在这里印**：HUD 的像素字体只有数字（见 drawDigit），字母画不出来，
+  // 所以配置信息放在**窗口标题**里（系统字体渲染，见 main 里的 title 组装）。
+
   std::snprintf(buf, sizeof(buf), "STRAIN MAX %.4f  MEAN %.4f  DROPS %d", ctx.mesh.maxRelativeStrain(),
                 ctx.mesh.meanRelativeStrain(), ctx.factorizeCount);
   glBegin(GL_LINES);
@@ -403,6 +407,11 @@ int main(int argc, char** argv) {
   bool pinTopEdge = true;
   bool pinSingle = false;
   int iters = 40;
+  // 窗口尺寸/位置可覆盖：同时开几个查看器做配置对照时（`--size 620 780 --pos 0 40` 等），
+  // 需要把它们并排摆在屏幕上才看得见差别。默认与老行为一致（1280x800、由系统决定位置）。
+  int winW = 1280, winH = 800;
+  int winX = 0, winY = 0;
+  bool winPosSet = false;
   // 收敛门槛取"实时档"：残差上限 0.3·|g|。
   // 实测（kappa=2305、60x60、600 帧）：门槛 0.3g 时每子步 1 次迭代、
   // 物理 3.2 ms/帧、58 FPS；门槛 1e-3 则 40 次迭代、47 ms、19 FPS。
@@ -429,6 +438,12 @@ int main(int argc, char** argv) {
     else if (a == "--damping" && i + 1 < argc) damping = std::atof(argv[++i]);
     else if (a == "--residual-tol" && i + 1 < argc) residualTol = std::atof(argv[++i]);
     else if (a == "--dt" && i + 1 < argc) dt = std::atof(argv[++i]);
+    else if (a == "--size" && i + 2 < argc) { winW = std::atoi(argv[++i]); winH = std::atoi(argv[++i]); }
+    else if (a == "--pos" && i + 2 < argc) {
+      winX = std::atoi(argv[++i]);
+      winY = std::atoi(argv[++i]);
+      winPosSet = true;
+    }
     else if (a == "--no-early-exit") noEarlyExit = true;
     else if (a == "--help" || a == "-h") {
       std::printf(
@@ -446,7 +461,9 @@ int main(int argc, char** argv) {
           "  --pin-corners     只钉两个角（默认钉整条上边）\n"
           "  --pin-single      只钉上边中点\n"
           "  --frames N        跑够 N 帧后截图并退出\n"
-          "  --shot FILE.png   退出前截图\n");
+          "  --shot FILE.png   退出前截图\n"
+          "  --size W H        窗口像素尺寸（默认 1280x800）\n"
+          "  --pos X Y         窗口左上角屏幕坐标（默认由系统决定；多窗口对照时用）\n");
       return 0;
     }
   }
@@ -523,7 +540,28 @@ int main(int argc, char** argv) {
     std::printf("GLFW 初始化失败\n");
     return 1;
   }
-  GLFWwindow* window = glfwCreateWindow(1280, 800, "PD cloth (distance constraints only)", nullptr, nullptr);
+  // 窗口标题里必须写清**本窗口跑的是哪套配置**：同时开几个查看器做对照时（例如弯曲的
+  // 全采样 / 单向 / 隔行），标题栏（系统字体渲染）是唯一能分辨它们的界面元素 ——
+  // HUD 那套像素字体**只有数字**（见 drawDigit，字母根本画不出来），指望不上。
+  char title[256];
+  char bendInfo[96];
+  if (ctx.mesh.bendCount() > 0) {
+    std::snprintf(bendInfo, sizeof(bendInfo), "BEND k=%.0f %s/s%d (stencils %d)", ctx.config.bendStiffness,
+                  bendSamplingName(ctx.config.bendSampling), ctx.config.bendStride,
+                  ctx.mesh.bendCount());
+  } else {
+    std::snprintf(bendInfo, sizeof(bendInfo), "BEND off");
+  }
+  char shearInfo[64];
+  if (ctx.config.shearStiffness > 0.0) {
+    std::snprintf(shearInfo, sizeof(shearInfo), "| shear k=%.0f", ctx.config.shearStiffness);
+  } else {
+    std::snprintf(shearInfo, sizeof(shearInfo), "| shear off");
+  }
+  std::snprintf(title, sizeof(title), "PD cloth %dx%d  stiffness %.0f  corners %d  | %s %s",
+                gridN, gridN, stiffness, pinTopEdge ? 0 : 1, bendInfo, shearInfo);
+  GLFWwindow* window = glfwCreateWindow(winW, winH, title, nullptr, nullptr);
+  if (window && winPosSet) glfwSetWindowPos(window, winX, winY);
   if (!window) {
     std::printf("创建窗口失败\n");
     glfwTerminate();

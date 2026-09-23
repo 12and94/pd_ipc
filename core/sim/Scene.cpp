@@ -84,6 +84,7 @@ SimContext makeScene(const SceneConfig& config) {
     }
     if (shear > 0.0 && config.meshPath.empty()) {
       const int added = ctx.mesh.addShearDiagonals(config.gridNx, config.gridNy, shear);
+      ctx.config.shearStiffness = shear;  // 生效值回写（同下面弯曲那条，仅供展示）
       std::printf("[scene] 剪切约束：新增对角边 %d 条（刚度 %g）⇒ 总边数 %d\n", added,
                   static_cast<double>(shear), ctx.mesh.edgeCount());
     }
@@ -134,6 +135,12 @@ SimContext makeScene(const SceneConfig& config) {
     if (bend > 0.0 && config.meshPath.empty()) {
       const int added =
           ctx.mesh.addBendingStencils(config.gridNx, config.gridNy, bend, bendOpt);
+      // 把**生效值**回写进 ctx.config：查看器要在 HUD 上印出"这个窗口是哪套配置"，
+      // 而环境变量覆盖只发生在 makeScene 内部（`ctx.config` 原本保留着覆盖前的值，
+      // 会让 HUD 显示成"没开弯曲"）。只影响展示，不参与任何计算。
+      ctx.config.bendStiffness = bend;
+      ctx.config.bendSampling = bendOpt.sampling;
+      ctx.config.bendStride = bendOpt.stride;
       std::printf("[scene] 弯曲约束：新增 stencil %d 条（刚度 %g，采样 %s，步长 %d）\n", added,
                   static_cast<double>(bend), bendSamplingName(bendOpt.sampling), bendOpt.stride);
       // 步长 >= 2 是**已实测否掉**的配置：没被采样的中心顶点可以吸收全部曲率，
