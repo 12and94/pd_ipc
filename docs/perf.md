@@ -1143,8 +1143,10 @@ Remove-Item Env:\PD_DEBUG_RESIDUAL
 # 运行时核对（换过 OpenMP 开关之后必做）：exe 里不应出现 libomp
 #   $b=[IO.File]::ReadAllBytes("build\Release\pd_bench.exe"); ([regex]::Matches([Text.Encoding]::ASCII.GetString($b),'libomp')).Count
 
-# 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3 A/B + 查看器时间线）
+# 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3/4c/4d A/B
+#   + §八 剪切 / §九 弯曲 / §十 采样变体 / §十一 惯性右端（已否）+ 查看器时间线）
 node build\_perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
+node build\_perf\check_report.js          # 几何 + 新板块自检（用 DOM 桩真跑一遍渲染代码）
 node build\_perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
 
 # 全局步（回代）的可行性审计：性质 / 层集 / 换排序 / 并行原型（结论见 docs/solver-feasibility.md）
@@ -1174,12 +1176,22 @@ node build\_perf\serve.js                # 可选：静态服务，浏览器开 
 #   ⚠ 源码已回退 ⇒ 现在跑它两端是同一份代码（差值应 ≈ 0）；要重做实验先把 §14 那几行改回去
 .\build\_perf\ab_inertial.ps1 -Reps 7               # 日志：build\_baseline\inertial_ab3.log
 
-# Phase 4c 的看板数据刷新（① 线程扫描日志 ② phase4c_ab.log）→ 重生成 → 起静态服务
-.\build\_perf\refresh_report.ps1            # 约 3 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
+# Phase 4c 的看板数据刷新（① 线程扫描日志 ② phase4c_ab.log ③ 剪切/弯曲/采样变体的 A/B 日志）
+#   → 重生成 → 自检 → 起静态服务
+.\build\_perf\refresh_report.ps1            # 约 5 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
 node build\_perf\make_report.js             # 生成 build\_perf\perf-report.html
-node build\_perf\check_report.js            # 几何自检（段数 / 越界 / 标尺文本）
+node build\_perf\check_report.js            # 自检（段数 / 越界 / 标尺文本 + 新板块非空与关键数字反查）
 node build\_perf\serve.js                   # http://127.0.0.1:8137/
 ```
+
+> **看板各板块的数据来源**（改脚本时这几对数不能脱钩）：
+> §五/§六/§七 ← `phase3_ab.log` / `phase4c_ab.log` / `phase4d_ab.log`（固定列格式，`parsePhase3`）；
+> §八 ← `shear_ab.log`（`ab_shear.ps1`）；§九 ← `bend_ab.log`（`ab_bend.ps1`）；
+> §十 ← `bend_variants_ab.log`（`ab_bend_variants.ps1`，"多配置 × 多档"格式，`parseVariants`）；
+> §十一 ← `inertial_ab3.log`（三方对照，需 `build/_baseline/pd_bench_ctrl_single.exe` 这个控制组二进制
+> —— 用 `#if 0` 把实验开关关掉再构建一次即可；**实验源码已回退**，见 §14）。
+> 两张"两值对照"表（§八/§九）由 `parseTwoWay` 解析；**解析口径**：绝对数列一律取
+> `单子步 x ms` 字段本身，不要"取行里第一个 x.y"（那是 `总耗时` 的秒数，见 §12.4）。
 
 > **每次触及热路径的改动都要在本文件补"前后对照"**（`docs/contributing.md` §6），
 > 并在提交信息里附上同一轮会话的成对数字。
