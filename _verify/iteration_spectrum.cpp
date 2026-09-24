@@ -145,7 +145,70 @@ int main(int argc, char** argv) {
 
   Eigen::VectorXd rhs(dim), sol(dim);
 
-  // ---- 自检：本工具**全部**建立在「A⁻¹ 就是 solve()」这个假设上 ----
+  // ---- 验证（用户要求「用他们的残差定义试试」）：他们的 `Get_Error()` 算的是 b − A·x，
+  //      其中 b = (M+fixed)/h²·old_X + Σκ·d_c，而 `old_X` 由 `Begin_Constraints()` 在**预测子之后**
+  //      备份（DYNAMIC_MESH.h: memcpy(old_X, X)，且 Update(t,it) 的顺序是 Update(t)→Begin_Constraints）
+  //      ⇒ old_X 就是预测子 x̂ ⇒ b − A·x 在数学上等于 **−∇E**，与我们的残差是**同一个量**。
+  //      下面把这个等价**数值验证**一遍（自由行；pin 行在两边都无意义）。
+  {
+    Eigen::VectorXd X = Eigen::VectorXd::Zero(dim);
+    Eigen::VectorXd Xhat = Eigen::VectorXd::Zero(dim);
+    for (int v = 0; v < n; ++v) {
+      const std::size_t i = static_cast<std::size_t>(v) * 3;
+      const Vec3& p = m.positions[static_cast<std::size_t>(v)];
+      const Vec3& q = ctx.predicted[static_cast<std::size_t>(v)];
+      X[i + 0] = p.x; X[i + 1] = p.y; X[i + 2] = p.z;
+      Xhat[i + 0] = q.x; Xhat[i + 1] = q.y; Xhat[i + 2] = q.z;
+    }
+    Eigen::VectorXd b = Eigen::VectorXd::Zero(dim);
+    {
+      // **不要手搓 b**：用手搓的第一版量级差了 1e6 倍（估计是某处索引/缩放写错）。
+      // 改用生产组装函数造 b：先做局部投影，再 M/h²·x̂ + Σκ·d_c。
+      DistanceTerm::project(m, ctx.targets);
+      assembleInertialRhs(m, ctx.predicted, dt, damping, b);
+      DistanceTerm::scatterInto(m, ctx.targets, b.data(), static_cast<std::size_t>(b.size()));
+      // 注意：**不调用 applyPinRhs**（pin 行下面会被排除），所以 b 的 pin 行保持 0
+    }
+    const Eigen::VectorXd Ax = A * X;
+    std::vector<Scalar> force(static_cast<std::size_t>(n) * 3, Scalar{0});
+    for (std::size_t c = 0; c < m.edges.size(); ++c) {
+      const Edge& e = m.edges[c];
+      const Vec3 rel = m.positions[static_cast<std::size_t>(e.a)] -
+                       m.positions[static_cast<std::size_t>(e.b)];
+      const Scalar len = length(rel);
+      const Vec3 d = (len <= 0.0) ? Vec3{} : rel * (e.restLength / len);
+      const Vec3 contrib = rel * e.stiffness - d * e.stiffness;
+      const std::size_t ia = static_cast<std::size_t>(e.a) * 3;
+      const std::size_t ib = static_cast<std::size_t>(e.b) * 3;
+      force[ia + 0] += contrib.x; force[ia + 1] += contrib.y; force[ia + 2] += contrib.z;
+      force[ib + 0] -= contrib.x; force[ib + 1] -= contrib.y; force[ib + 2] -= contrib.z;
+    }
+    Scalar maxTheir = 0.0, maxOurs = 0.0, sumTheir = 0.0, sumOurs = 0.0;
+    for (const int v : freeIdx) {
+      const std::size_t i = static_cast<std::size_t>(v) * 3;
+      const Scalar mass = m.masses[static_cast<std::size_t>(v)];
+      const Vec3 e{b[i + 0] - Ax[i + 0], b[i + 1] - Ax[i + 1], b[i + 2] - Ax[i + 2]};
+      const Vec3 inertia{(X[i + 0] - Xhat[i + 0]) * (mass * invH2),
+                         (X[i + 1] - Xhat[i + 1]) * (mass * invH2),
+                         (X[i + 2] - Xhat[i + 2]) * (mass * invH2)};
+      const Vec3 grad{inertia.x + force[i + 0], inertia.y + force[i + 1], inertia.z + force[i + 2]};
+      const Scalar rt = length(e) / mass;
+      const Scalar ro = length(grad) / mass;
+      if (rt > maxTheir) maxTheir = rt;
+      if (ro > maxOurs) maxOurs = ro;
+      sumTheir += rt * rt;
+      sumOurs += ro * ro;
+    }
+    const Scalar relDiff = std::fabs(maxTheir - maxOurs) / std::fmax(1e-300, maxOurs);
+    std::printf("      他们的残差（b−Ax，自由行）：max %.9g / 2范数 %.9g\n", maxTheir, std::sqrt(sumTheir));
+    std::printf("      我们的残差（∇E，自由行）  ：max %.9g / 2范数 %.9g\n", maxOurs, std::sqrt(sumOurs));
+    std::printf("      相对差 %.2e ⇒ %s\n", relDiff,
+                relDiff < 1e-9 ? "**同一个量**：他们的残差定义 ≡ 我们的 ⇒ 口径不是差距来源"
+                               : "**不是同一个量** ⇒ 口径可能是差距来源");
+    const Scalar prod = nonlinearResidual(ctx);
+    std::printf("      （生产 nonlinearResidual 给的 max = %.9g，应与上面第二行一致）\n", prod);
+  }
+
   // 幂迭代第一版给出 ρ(T) ≈ 9194（理论上不可能：B 的广义特征值必 ≤ 1）⇒ 先验一遍这个假设：
   // 随机 v → w = A·v → solve(w) 是否回到 v。
   {
