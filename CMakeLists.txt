@@ -159,6 +159,9 @@ add_executable(pd_solvecomp _verify/solve_components.cpp)
 target_link_libraries(pd_solvecomp PRIVATE pd_core)
 
 # 三分量因子"只存一份 vs 各存一份"的实测（紧凑单份 + 逐位比对 + 冷/热两档微基准）
+add_executable(pd_restrace _verify/residual_trace.cpp)
+target_link_libraries(pd_restrace PRIVATE pd_core)
+
 add_executable(pd_sharefactor _verify/share_factor.cpp)
 target_link_libraries(pd_sharefactor PRIVATE pd_core)
 

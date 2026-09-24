@@ -176,6 +176,15 @@ if ($sf) {
   if ($sf.Out -match '最大逐元素差 0\.000e\+00') { Good 'pd_sharefactor：单份求解 == 各份求解（逐位）' }
   else { Bad 'pd_sharefactor：单份求解与各份求解不再逐位相同' }
 }
+# 残差-迭代曲线工具（_verify/residual_trace.cpp，pd_restrace）：它给出的 2 范数曲线依赖
+# 「复算每顶点残差」（生产的 nonlinearResidual 只返回 max 范数），而复算必须与生产**逐位一致**，
+# 否则曲线不可信。这里用最小工况把这条自校验钉住。
+$rt = RunExe 'pd_restrace' @('--grid', '20', '--steps', '5', '--iters', '4')
+if ($rt) {
+  if ($rt.Code -ne 0) { Bad "pd_restrace exit=$($rt.Code)（复算残差与生产不一致 ⇒ 曲线不可信）" }
+  elseif ($rt.Out -match '一致 ✓') { Good 'pd_restrace：复算残差与生产 nonlinearResidual 逐位一致（2 范数曲线可信）' }
+  else { Bad 'pd_restrace：没看到「一致 ✓」自校验行' }
+}
 
 # ---------------------------------------------------------------------------
 # ⑥ 迭代预算三档预设（docs/perf.md §18）：唯一权威是 core/sim/Scene.h 的 iterationPresetTable()。
