@@ -141,7 +141,8 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 > `hang_test`、`init_audit`、`iteration_scan`、`scale_sweep`、`stiffness_calibration` 等。
 > 它们记录了当时的推理路径，可作追溯用，但结论请以 `pd_check` 与两个测试套件为准。
 
-这些程序**已全部纳入常规构建**：`CMakeLists.txt` 里各有 `add_executable`（现有 20+ 个），
+这些程序**已全部纳入常规构建**：`CMakeLists.txt` 里各有 `add_executable`（**2026-09-24 实测 28 个目标**；
+写**目标数**、别写 `build\Release\` 下的 exe 数 —— 那里有 32 个，多出来的是历史残留产物），
 一次 `.\tools\build.ps1` 就全部产出到 `build\Release\`，**不需要手工再加构建行**。
 但它们**仍然不是受支持验收集**，部分前提假设已过期 —— 以 `README.md` §3 的验收集与
 `docs/perf.md` 的对照表为准。
