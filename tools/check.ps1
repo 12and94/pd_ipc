@@ -39,8 +39,18 @@ function RunExe([string]$name, [string[]]$exeArgs) {
     Bad "缺可执行文件 build\Release\$name.exe（先跑 .\tools\build.ps1）"
     return $null
   }
-  $out = (& $exe @exeArgs 2>&1 | Out-String)
-  return [pscustomobject]@{ Name = $name; Code = $LASTEXITCODE; Out = $out }
+  # ⚠️ 必须在本地把 ErrorActionPreference 降下来：PS 5.1 会把**原生命令写到 stderr 的任何一行**
+  # 包装成 NativeCommandError，而本脚本开头是 'Stop' ⇒ 一行无害的告警就会让整个门禁中断。
+  # （第一次就是这么被 pd_bendaudit 拦住 的：求解器对合成矩阵打了一行"退回旧路径"的说明。）
+  $eap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = (& $exe @exeArgs 2>&1 | Out-String)
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $eap
+  }
+  return [pscustomobject]@{ Name = $name; Code = $code; Out = $out }
 }
 
 # 从程序输出里抓一个数：抓不到就是**自报格式变了**（那也是失败 —— 否则文档数字会悄悄失去来源）
