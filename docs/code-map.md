@@ -3,6 +3,7 @@
 > 本文档只讲两件事：**每部分代码在哪**、**怎么运行并看结果**。
 > 计划与设计见 `docs/plan.md`，进度与现象记录见 `README.md`，
 > **收敛问题的成因与刚度标定见 `docs/pd-convergence.md`**，
+> **Chebyshev 加速的原理与落地形态（含我们该开/不该开的时机）见 `docs/chebyshev.md`**，
 > **并行改造方案见 `docs/parallel-refactor.md`（Phase 1 已实施）、性能记录见 `docs/perf.md`**，
 > **现存问题与优化机会见 `docs/open-issues.md`**。
 

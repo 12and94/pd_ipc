@@ -507,6 +507,8 @@ A = M/h² + Σ_c κ_c A_cᵀ A_c   N = Σ_c κ_c A_cᵀ (n_c n_cᵀ) A_c
    它只在**慢模主导**（稳态/接近平衡）时才赢。这与 Wang 2015 "延迟 S = 10 次再开 Chebyshev、
    且 ρ 宁取小"的做法完全一致。⇒ 上 Chebyshev 的正确形态是"**稳态启用**"，而不是全程开。
 
+**Chebyshev 到底怎么用**（原理、递推、该开/不该开的时机、落地影响面）：见 [`docs/chebyshev.md`](chebyshev.md)。
+
 **复现**：
 
 ```powershell
