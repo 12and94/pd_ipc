@@ -381,6 +381,53 @@ Bench runBench(const FactorSet& fs, const Compact& cf, const std::vector<double>
   return r;
 }
 
+/// 排序探针：从 3n×3n 的 Ã ⊗ I₃ 矩阵里抽出"单条链"的**标量图**（取 i%3 == j%3 == 0 的那些项），
+/// 用与生产相同的方式（自己调 AMD + NaturalOrdering LDLᵀ）分解，返回单链因子的 nnz。
+/// 用途：三条链同构 ⇒ 可以只在一条链上排序、再把相对顺序复制给三条；若 3×(单链 nnz) 明显更小，
+/// 说明"三条链混在一起"让 AMD 的排序变差了（填充由"消元顺序 + 整体结构"共同决定，见 §1.9）。
+bool scalarFactorNnz(const SpMat& L, long long& outNnz, int& outN) {
+  const int n = static_cast<int>(L.rows());
+  if (n <= 0 || n % kComponents != 0) return false;
+  const int m = n / kComponents;
+
+  std::vector<Eigen::Triplet<double>> trips;
+  for (int k = 0; k < L.outerSize(); ++k) {
+    for (SpMat::InnerIterator it(L, k); it; ++it) {
+      const int i = static_cast<int>(it.row());
+      const int j = static_cast<int>(it.col());
+      if (i % kComponents == 0 && j % kComponents == 0) {
+        trips.emplace_back(i / kComponents, j / kComponents, it.value());
+      }
+    }
+  }
+  if (trips.empty()) return false;
+
+  SpMat Ls(m, m);
+  Ls.setFromTriplets(trips.begin(), trips.end());
+  const SpMat sym = Ls.selfadjointView<Eigen::Lower>();
+
+  Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> pinv;
+  Eigen::AMDOrdering<int> ordering;
+  ordering(sym, pinv);
+  Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P;
+  if (pinv.size() > 0) {
+    P = pinv.inverse();
+  } else {
+    P.resize(m);
+  }
+
+  SpMat ap(m, m);
+  ap.selfadjointView<Eigen::Lower>() = sym.selfadjointView<Eigen::Lower>().twistedBy(P);
+  Eigen::SimplicialLDLT<SpMat, Eigen::Lower, Eigen::NaturalOrdering<int>> s;
+  s.analyzePattern(ap);
+  s.factorize(ap);
+  if (s.info() != Eigen::Success) return false;
+
+  outNnz = static_cast<long long>(s.matrixL().nestedExpression().nonZeros());
+  outN = m;
+  return true;
+}
+
 void printUsage() {
   std::printf(
       "用法：pd_sharefactor [--grid N M] [--stiffness K] [--reps R] [--threads T] [--flush-mb F]\n"
@@ -527,5 +574,26 @@ int main(int argc, char** argv) {
       "  判读规则：**只看冷档**。热档的紧循环会让因子住在 L3 里，高估「只存一份」的收益\n"
       "  （2026-09-22 的 CSR 变体就是被这一点骗过：微基准 +23~29 %%，真实管线只剩 −8~−10 %%，\n"
       "  见 docs/perf.md §8.4）。冷档收益若在噪声（<5 %%）内，结论就是「不做」。\n");
+  // ---- ⑤ 排序探针：联合图（现状） vs 单条链排序后复制 ----
+  // 内置的三种排序里 AMD 已完胜（Natural 2.0–4.7×、COLAMD 5.5–12.8× 更差，见 docs/perf.md §17），
+  // 所以"换排序"只剩一条路：换一个**比 AMD 更好**的排序。三条链同构 ⇒ 可以只在一条链上排序、
+  // 复制给三条。这个探针就是量它值不值（确定性、秒级）。
+  {
+    std::printf("\n--- ⑤ 排序探针：三条链一起排序（现状） vs 只排一条链再复制 ---\n");
+    long long nnzScalar = 0;
+    int nScalar = 0;
+    if (scalarFactorNnz(L, nnzScalar, nScalar)) {
+      const long long replicated = static_cast<long long>(kComponents) * nnzScalar;
+      std::printf("  单条链（标量图，%d 个未知量）AMD 因子 nnz = %lld  ⇒ 复制到三条 = %lld\n", nScalar,
+                  nnzScalar, replicated);
+      std::printf("  联合图（现状）因子 nnz = %lld（每分量 %lld）\n", factorNnz, factorNnz / kComponents);
+      std::printf("  ⇒ 比值 %.4f：%s\n", static_cast<double>(replicated) / static_cast<double>(factorNnz),
+                  replicated < factorNnz ? "**复制排序更省填充 ⇒ 值得试**"
+                                         : "**复制排序并不更省（联合图上的 AMD 已经更好或持平）⇒ 此路不通**");
+    } else {
+      std::printf("  抽不出单条链的标量图（矩阵不是 Ã ⊗ I₃）—— 跳过。\n");
+    }
+  }
+
   return bitwise ? 0 : 3;
 }
