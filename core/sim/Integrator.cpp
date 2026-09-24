@@ -14,6 +14,7 @@
 namespace pd {
 
 namespace {
+constexpr Scalar kPi = Scalar{3.14159265358979323846};
 
 using Clock = std::chrono::steady_clock;
 
@@ -500,6 +501,31 @@ int stepOnce(SimContext& ctx) {
       const char* s = std::getenv("PD_CHEB_START");
       return (s != nullptr && *s != '\0') ? std::atoi(s) : 10;
     }();
+    // v2①：把 ω 递推从"单个 ρ"推广到真实区间 [λ_min, λ_max]。
+    // 记 m = (λmin+λmax)/2、δ = (λmax−λmin)/2 —— Wang 的形式恰是 (m=1, δ=ρ) 的特例：
+    //     他的 ω_{S+1} = 2/(2−ρ²)      ≡ 1/(m − δ²/2)
+    //     他的 ω_{k+1} = 4/(4−ρ²·ω_k)  ≡ 1/(m − δ²·ω_k/4)
+    // 所以下面这套是**严格推广**，取 (m=1, δ=ρ) 时与 v1 逐位相同。
+    static const bool chebInterval = [] {
+      const char* s = std::getenv("PD_CHEB_MODE");
+      if (s != nullptr && std::strcmp(s, "interval") == 0) {
+        std::fprintf(stderr,
+                     "[cheb] ⚠ 区间模式是**实验性**的，实测在本项目上会发散（见 docs/chebyshev.md §7.4）：\n"
+                     "       60×60 上 20 次迭代就到 9.6e5 m/s²、80 次到 1.6e27。原因是真实区间\n"
+                     "       [0.0012, 0.9994] 要求 ω 最大到 1/λmin ≈ 821，而 PD 是非线性的，\n"
+                     "       超大 ω 会把状态抛离不动点 ⇒ 局部投影失效。日常请用 PD_CHEB=1（ρ 封顶 ≈2）。\n");
+        return true;
+      }
+      return false;
+    }();
+    static const Scalar chebM = [] {
+      const char* s = std::getenv("PD_CHEB_M");
+      return (s != nullptr && *s != '\0') ? static_cast<Scalar>(std::atof(s)) : Scalar{1};
+    }();
+    static const Scalar chebD = [] {
+      const char* s = std::getenv("PD_CHEB_D");
+      return (s != nullptr && *s != '\0') ? static_cast<Scalar>(std::atof(s)) : Scalar{1};
+    }();
     Scalar chebOmega = Scalar{1};
     for (int k = 0; k < cfg.maxIterations; ++k) {
       // 4b+4c) 融合的"投影 + 散射"（2026-09-22）：按颜色就地算 d_c 并直接累加到右端，
@@ -562,10 +588,33 @@ int stepOnce(SimContext& ctx) {
       //     不构成读序依赖，不需要额外的 barrier。这取代了原来 single 里的串行整趟
       //     O(E) 遍历（那是 Phase 3 要消掉的最后一块串行工作）。
       // ω 递推（每迭代一个标量；chebEnabled 为假时整段不执行）
-      const bool chebBlend = chebEnabled && (k > chebStart);
+      // interval 模式用**全部 T 个根**（从 k=0 就合成，j=k+1）；rho 模式保留预热 S 次。
+      const bool chebBlend = chebEnabled && (chebInterval || (k > chebStart));
       if (chebBlend) {
-        if (k == chebStart + 1) chebOmega = Scalar{2} / (Scalar{2} - chebRho * chebRho);
-        else chebOmega = Scalar{4} / (Scalar{4} - chebRho * chebRho * chebOmega);
+        if (!chebInterval) {
+          // 模式 rho：v1，隐含把谱区间当作 [1−ρ, 1+ρ]
+          if (k == chebStart + 1) chebOmega = Scalar{2} / (Scalar{2} - chebRho * chebRho);
+          else chebOmega = Scalar{4} / (Scalar{4} - chebRho * chebRho * chebOmega);
+        } else {
+          // 模式 interval：真实区间 [λmin, λmax]，用**根序列**（v2①的正确形式）
+          //
+          // **踩坑记录（务必保留）**：第一版是把 Wang 的递推"严格推广"成
+          //     1/(m − δ²ω/4)，它在 40 次迭代时把我方残差压到 0.0089（比朴素好 ~970×），
+          //     但 80 次直接发散（7.9977e15）、160 次 1.58694e37。
+          //   根因：那套递推让 ω 收敛到一个 ~1.9–2.7 的**常数**，而
+          //     |1 − ω·λ_max| = |1 − 2.66×0.9994| ≈ 1.66 > 1
+          //   ⇒ **快模态被逐步放大**。区间法的稳定性只能靠"整周期的乘积 ≤ 1"，不能靠"固定的 ω"。
+          //
+          // 正确形式：把 P(λ)=∏(1 − λ/r_j) 的根取成 Chebyshev 节点
+          //     r_j = m + δ·cos((2j−1)π/(2T)),   ω_j = 1/r_j,   j = 1..T
+          // 其中 T = 本子步的迭代预算（我们知道！）。这时 P(λ) = T_T(t)/T_T(t0)，t=(λ−m)/δ，
+          // t0 = −m/δ，**在整个区间上 |P| ≤ 1/|T_T(t0)| < 1** ⇒ 区间内任何模态都不会被放大。
+          // 这里从 k=1 开始用 j=k+1（k=0 仍是朴素一步），少用第一个根，稳得多且实现最简。
+          const Scalar T = static_cast<Scalar>(cfg.maxIterations);
+          const Scalar j = static_cast<Scalar>(k + 1);   // k=0 ⇒ j=1（第一个根，ω≈1/λmax）
+          const Scalar theta = kPi * (Scalar{2} * j - Scalar{1}) / (Scalar{2} * T);
+          chebOmega = Scalar{1} / (chebM + chebD * std::cos(theta));
+        }
       }      Scalar localDiff = 0.0;
       Scalar localScale = 0.0;
       Scalar localResidual = 0.0;
