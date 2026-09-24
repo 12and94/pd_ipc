@@ -473,6 +473,34 @@ int stepOnce(SimContext& ctx) {
     // ---------------------------------------------------------------
     // 4) PD 迭代：局部步 → 散射 → 覆盖 pin → 全局步 → 判据（循环留在区域内）
     // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // Chebyshev 加速（Wang 2015 的形式）。**默认关**：不设 PD_CHEB 时，下面的
+    // `chebEnabled == false` ⇒ 热路径与改动前**逐字不变**（门禁第 ④ 步因此不受影响）。
+    //
+    //   PD_CHEB=1          启用；PD_CHEB_RHO=ρ（默认 0.98，"宁小勿大"：估大了会震荡）
+    //   PD_CHEB_START=S    前 S 次仍跑朴素 PD（默认 10，论文取法），之后转 Chebyshev
+    //
+    // 形式：x_k ← ω_k (f(x_k) − x_{k−1}) + x_{k−1}，ω 递推
+    //   k ≤ S: ω = 1；k = S+1: ω = 2/(2−ρ²)；k > S+1: ω = 4/(4−ρ²·ω_prev)
+    // 注意 ω = 1 时**不做合成**（(a−b)+b 在浮点下 ≠ a）⇒ 预热阶段仍是"逐字朴素 PD"。
+    //
+    // 口径说明（v1 已知偏差）：非线性残差仍由**未加速解**算出（xSolution 是这一趟的
+    // 邻居读源，若就地改写会破坏"邻居读序无关"的前提、引入不确定性）。对慢模态而言
+    // 未加速残差是**偏悲观**的估计 ⇒ 残差判据不会过早放行，这是安全的方向。
+    // 速度更新用的是 m.positions，也就是**加速后**的位形。
+    static const bool chebEnabled = [] {
+      const char* s = std::getenv("PD_CHEB");
+      return s != nullptr && *s != '\0' && *s != '0';
+    }();
+    static const Scalar chebRho = [] {
+      const char* s = std::getenv("PD_CHEB_RHO");
+      return (s != nullptr && *s != '\0') ? static_cast<Scalar>(std::atof(s)) : Scalar{0.98};
+    }();
+    static const int chebStart = [] {
+      const char* s = std::getenv("PD_CHEB_START");
+      return (s != nullptr && *s != '\0') ? std::atoi(s) : 10;
+    }();
+    Scalar chebOmega = Scalar{1};
     for (int k = 0; k < cfg.maxIterations; ++k) {
       // 4b+4c) 融合的"投影 + 散射"（2026-09-22）：按颜色就地算 d_c 并直接累加到右端，
       //    不再物化 targets 中间量（省掉它的写+读，以及两个端点位置的一次重复读取）。
@@ -533,7 +561,12 @@ int stepOnce(SimContext& ctx) {
       //     取 xSolution —— 与这一趟写的 m.positions[i] 是同一个值，所以"邻居还没解包"
       //     不构成读序依赖，不需要额外的 barrier。这取代了原来 single 里的串行整趟
       //     O(E) 遍历（那是 Phase 3 要消掉的最后一块串行工作）。
-      Scalar localDiff = 0.0;
+      // ω 递推（每迭代一个标量；chebEnabled 为假时整段不执行）
+      const bool chebBlend = chebEnabled && (k > chebStart);
+      if (chebBlend) {
+        if (k == chebStart + 1) chebOmega = Scalar{2} / (Scalar{2} - chebRho * chebRho);
+        else chebOmega = Scalar{4} / (Scalar{4} - chebRho * chebRho * chebOmega);
+      }      Scalar localDiff = 0.0;
       Scalar localScale = 0.0;
       Scalar localResidual = 0.0;
       int localResidualVertex = -1;
@@ -547,10 +580,22 @@ int stepOnce(SimContext& ctx) {
       for (long long v = 0; v < n; ++v) {
         const std::size_t i = static_cast<std::size_t>(v);
         const Vec3 xNew{ctx.xSolution[3 * i + 0], ctx.xSolution[3 * i + 1], ctx.xSolution[3 * i + 2]};
-        m.positions[i] = xNew;
-        localDiff = std::max(localDiff, maxAbsComponent(xNew - previous[i]));
+        // Chebyshev：把未加速解与"上一步位形"按 ω 合成（ω = 1 时走下面 else 分支，
+        // 逐字保持朴素 PD 的算术；previous[i] 正好就是 x_{k−1}，与 Wang 的 prev_X 同义）。
+        if (chebBlend) {
+          const Vec3 xPrev = previous[i];
+          const Vec3 xPut{xPrev.x + (xNew.x - xPrev.x) * chebOmega,
+                          xPrev.y + (xNew.y - xPrev.y) * chebOmega,
+                          xPrev.z + (xNew.z - xPrev.z) * chebOmega};
+          m.positions[i] = xPut;
+          localDiff = std::max(localDiff, maxAbsComponent(xPut - xPrev));
+          previous[i] = xPut;   // 下一迭代的 x_{k−1} 是**加速后**的位形
+        } else {
+          m.positions[i] = xNew;
+          localDiff = std::max(localDiff, maxAbsComponent(xNew - previous[i]));
+          previous[i] = xNew;
+        }
         localScale = std::max(localScale, maxAbsComponent(ctx.predicted[i] - ctx.positionsBeforeStep[i]));
-        previous[i] = xNew;
 
         if (gatherResidual) {
           const Scalar mass = m.masses[i];
