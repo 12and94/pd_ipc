@@ -138,7 +138,10 @@ int main(int argc, char** argv) {
   int grid = 100;
   int iters = 64;
   int steps = 600;
-  int settleIters = 40;   // 稳态阶段每子步跑几次迭代（取查看器"实时档"的 40，别把稳态跑得过收敛）
+  int settleIters = 40;
+  bool trajMode = false;      // ④：轨迹误差口径（对照参考解）
+  int trajSteps = 20;       // 跑多少子步再比末态
+  int trajRefIters = 512;   // 参考解每子步的迭代数   // 稳态阶段每子步跑几次迭代（取查看器"实时档"的 40，别把稳态跑得过收敛）
   Scalar stiffness = 2305.0;
   Scalar spacing = 0.02;
   Scalar density = 1.0;
@@ -162,6 +165,9 @@ int main(int argc, char** argv) {
     else if (a == "--soft-mass") next(softMass);
     else if (a == "--dt") next(dt);
     else if (a == "--damping") next(damping);
+    else if (a == "--traj") trajMode = true;
+    else if (a == "--traj-steps") nextInt(trajSteps);
+    else if (a == "--traj-ref") nextInt(trajRefIters);
     else if (a == "--pin" && i + 1 < argc) {
       const char* v = argv[++i];
       if (std::strcmp(v, "top") == 0) { pinMode = 1; pinTop = true; }
@@ -211,6 +217,46 @@ int main(int argc, char** argv) {
   refreshPinPositions(ctx);
   ensureBuffers(ctx);
 
+  // ---- ④ 轨迹误差口径（--traj）：论文图可能是"用不同迭代预算跑完整段、再与参考解比" ----
+  // 对每个 K：新建同配置场景，跑 trajSteps 个子步、每子步 K 次迭代（判据全关），取末态；
+  // 参考解用 trajRefIters 次/子步。误差 = ‖X_K − X_ref‖₂ / ‖X_ref − X_0‖₂（位移尺度归一）。
+  auto runTraj = [&](int perStep, int nsteps) {
+    SceneConfig c2 = cfg;
+    c2.maxIterations = perStep;
+    SimContext cx = makeScene(c2);
+    if (pinMode == 1) {
+      for (auto& z : cx.mesh.pinned) z = 0;
+      for (int x = 0; x < grid; ++x) cx.mesh.pinned[static_cast<std::size_t>((grid - 1) * grid + x)] = 1;
+    } else if (pinMode == 2) {
+      for (auto& z : cx.mesh.pinned) z = 0;
+      cx.mesh.masses[static_cast<std::size_t>((grid - 1) * grid)] += softMass;
+      cx.mesh.masses[static_cast<std::size_t>((grid - 1) * grid + grid - 1)] += softMass;
+    }
+    refreshPinPositions(cx);
+    ensureBuffers(cx);
+    for (int st = 0; st < nsteps; ++st) stepOnce(cx);
+    return cx.mesh.positions;
+  };
+  auto distNorm = [](const std::vector<Vec3>& a, const std::vector<Vec3>& b) {
+    Scalar acc = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const Vec3 d = a[i] - b[i];
+      acc += d.x * d.x + d.y * d.y + d.z * d.z;
+    }
+    return std::sqrt(acc);
+  };
+  if (trajMode) {
+    const std::vector<Vec3> init = runTraj(10, 0);
+    const std::vector<Vec3> ref = runTraj(trajRefIters, trajSteps);
+    const Scalar scale = std::fmax(1e-12, distNorm(ref, init));
+    std::printf("=== ④ 轨迹误差口径：跑 %d 子步后与参考解（每子步 %d 次）比 ===\n", trajSteps, trajRefIters);
+    std::printf("（位移尺度 ‖X_ref − X_0‖₂ = %.6g；表格里给出的是相对值）\n", scale);
+    for (const int K : {1, 2, 4, 8, 16, 32, 64}) {
+      const std::vector<Vec3> xk = runTraj(K, trajSteps);
+      std::printf("  K=%3d 次/子步   轨迹相对误差 = %.6g\n", K, distNorm(xk, ref) / scale);
+    }
+    return 0;
+  }
   // 跑到准静态
   for (int s = 0; s < steps; ++s) stepOnce(ctx);
   const Scalar vmax = maxSpeed(ctx);
