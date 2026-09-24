@@ -213,7 +213,10 @@ const IterationPresetInfo* iterationPresetTable() {
   static const IterationPresetInfo kTable[] = {
       {"preview", 20, 0.3, "预览档：迭代数减半，换帧率；弹性能与实时档差 ~0.5 %"},
       {"realtime", 40, 0.3, "实时档（查看器默认，与历史基线一致）"},
-      {"accurate", 80, 1.0e-3, "精度档：离线对照 / 回归；瞬态明显更接近平衡"},
+      {"accurate", 80, 1.0e-3,
+       "精度档：80 次迭代 + 1e-3 门槛。⚠️ 实测多数工况**门槛达不到** ⇒ 实际是「用尽迭代」档"
+       "（查看器稳态跑满 80 次才勉强压到 0.0094·|g|；40×40/κ=1e4 跑满 80 次仍 0.65·|g|）——"
+       "见 docs/perf.md §18.6。要「更接近平衡」只能加迭代，门槛本身帮不上忙。"},
       {nullptr, 0, 0.0, nullptr},
   };
   return kTable;
