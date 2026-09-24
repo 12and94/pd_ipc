@@ -603,12 +603,12 @@ scatter 对 1–40 MB 数据的访问，因子是**冷的**）它要多读一整
 - ⚠️ **绝对值只在同一小节内可比**：本表 100×100 的 4.764 ms 与 §10.2 表里的 6.226 → 5.697 ms 来自
   **不同会话**，5.697 > 4.764 **不代表 Phase 4d 变慢**（4d 只可能更快）—— 那是跨会话漂移（本文件 §0 的纪律）。
   引用绝对 ms 时请连会话一起引；相对百分比在同一小节内是自洽的。
-- **上表是第一轮测量**。看板用的是 `build/_perf/refresh_report.ps1` 生成的**第二轮**（同轮会话内交替 5 次
+- **上表是第一轮测量**。看板用的是 `_perf/refresh_report.ps1` 生成的**第二轮**（同轮会话内交替 5 次
   取最小；与第一轮差 0.5 个百分点以内，属噪声）：40×40/4T **4.997 → 2.910（−41.8 %）**、
   18T 7.257 → 4.097（−43.5 %）、交互档 0.663 → 0.385（−41.9 %）、100×100 11.714 → 5.969（−49.0 %）、
   200×200 92.123 → 65.796（−28.6 %）。看板生成链：
-  `.\build\_perf\refresh_report.ps1`（写 `build/_perf/logs/` 与 `build/_baseline/phase4c_ab.log`）
-  → `node build\_perf\make_report.js` → `node build\_perf\serve.js`（http://127.0.0.1:8137/）。
+  `.\_perf\refresh_report.ps1`（写 `build/_perf/logs/` 与 `build/_baseline/phase4c_ab.log`）
+  → `node _perf\make_report.js` → `node _perf\serve.js`（http://127.0.0.1:8137/）。
 - **补充的两组数字（同轮交替取最小）**：
   · 200×200 / iters10 / **100 子步**（原先只用 8–12 子步，一次性分解被摊入而偏保守）：
     旧 **107.64** → 新 **59.54 ms/子步** = **−44.7 %**；
@@ -790,7 +790,7 @@ f_v = Σ_{stencil 含 v}  -k·w_v·(x_a - 2 x_b + x_c)
 实现上**两条路径共用同一个 `bendForceAt()`**（不是"两处各写一份、靠两张 CSR 顺序一致去论证"），
 所以"逐位相同"是**构造性**的。`PD_DEBUG_RESIDUAL=1` 的两口径自查启用弯曲后仍是 0 次告警。
 
-### 12.4 前后对照（同一轮会话内交替 5 次取最小值，vcomp，4 线程，`build/_perf/ab_bend.ps1`）
+### 12.4 前后对照（同一轮会话内交替 5 次取最小值，vcomp，4 线程，`_perf/ab_bend.ps1`）
 
 工况：**40×40 / iters 40 / 300 子步 / 4 线程 / `PD_BEND=1000`**
 
@@ -923,7 +923,7 @@ Remove-Item Env:\PD_BEND
 .\build\Release\pd_bendaudit.exe
 
 # 开/关成对 A/B（同轮交替、重复 5 次取最小值；日志写 build\_baseline\bend_ab.log）
-.\build\_perf\ab_bend.ps1 -Reps 5
+.\_perf\ab_bend.ps1 -Reps 5
 ```
 
 ---
@@ -953,7 +953,7 @@ Remove-Item Env:\PD_BEND
 多少约束耦合"决定 —— 弯曲 stencil 的耦合半径是 2，少取就直接少填充。它**不碰任何架构性质**：
 stencil 变少 ⇒ `L = Ã ⊗ I₃`、只分解一次、三分量并行回代都自动成立（本轮加了逐块断言，见 §13.5）。
 
-### 13.2 同一轮会话交替 5 次取最小值（`build/_perf/ab_bend_variants.ps1`）
+### 13.2 同一轮会话交替 5 次取最小值（`_perf/ab_bend_variants.ps1`）
 
 工况：**40×40 / iters 40 / 300 子步 / 4 线程 / κ = 1e4**，`PD_BEND` 见下表。
 （"单子步"= 每子步 ms；其余阶段列 = 300 子步累计 ms。见 §12.4 的单位口径说明。）
@@ -1065,7 +1065,7 @@ stencil 变少 ⇒ `L = Ã ⊗ I₃`、只分解一次、三分量并行回代�
 
 ```powershell
 # 采样变体的降本对照（同一轮会话交替 5 次取最小值；日志 build\_baseline\bend_variants_ab.log）
-.\build\_perf\ab_bend_variants.ps1 -Reps 5
+.\_perf\ab_bend_variants.ps1 -Reps 5
 
 # 单点：只取行方向的完整采样（k=2000 补回一半密度）
 $env:PD_BEND='2000'; $env:PD_BEND_SAMPLING='rows'; $env:PD_BEND_STRIDE='1'
@@ -1097,7 +1097,7 @@ Remove-Item Env:\PD_BEND,Env:\PD_BEND_SAMPLING,Env:\PD_BEND_STRIDE
 同步点数也不变（原来靠 `single` 的隐式 barrier，现在靠 `for` 的隐式 barrier，两者的位置
 正好就是"预测已完成"与"bBase 已写完"所必需的那两个）。
 
-**实测**（`build/_perf/ab_inertial.ps1`，同轮交替 7 次取最小，40×40 / iters 40 / 300 子步）
+**实测**（`_perf/ab_inertial.ps1`，同轮交替 7 次取最小，40×40 / iters 40 / 300 子步）
 ——注意这里用了**三方**：旧 single 二进制、新 `for` 二进制、以及**控制组**（同一份新源码
 把 `#if` 关掉、即走 single 路径再构建一次）：
 
@@ -1126,7 +1126,7 @@ Remove-Item Env:\PD_BEND,Env:\PD_BEND_SAMPLING,Env:\PD_BEND_STRIDE
 另一种形态。
 
 **代码去向**：实现**已回退**（不留 `#if` 开关、不留死代码）。复现只用
-`build/_perf/ab_inertial.ps1` + 把 §14 里那 6 行改回去。
+`_perf/ab_inertial.ps1` + 把 §14 里那 6 行改回去。
 
 ---
 
@@ -1160,9 +1160,9 @@ $env:PD_DEBUG_RESIDUAL='1'
 Remove-Item Env:\PD_DEBUG_RESIDUAL
 
 # Phase 3 的前后对照（同一会话内交替 A/B、取最小值；脚本自己核对两个 exe 的 OpenMP 运行时）
-#   ⚠ 该脚本在 build/ 下（被 gitignore），且**必须带 UTF-8 BOM** —— PowerShell 5.1 读无 BOM 的
+#   ⚠ 该脚本在 `_perf/` 下（2026-09-24 起纳入版本控制），且**必须带 UTF-8 BOM** —— PowerShell 5.1 读无 BOM 的
 #     中文 .ps1 会按 GBK 解码而报语法错。改完请复查前 3 字节是 EF BB BF。
-.\build\_perf\ab_residual.ps1 -Reps 4        # 日志写到 build\_baseline\phase3_ab.log
+.\_perf\ab_residual.ps1 -Reps 4        # 日志写到 build\_baseline\phase3_ab.log
 
 # 运行时核对（换过 OpenMP 开关之后必做）：exe 里不应出现 libomp
 #   $b=[IO.File]::ReadAllBytes("build\Release\pd_bench.exe"); ([regex]::Matches([Text.Encoding]::ASCII.GetString($b),'libomp')).Count
@@ -1170,15 +1170,15 @@ Remove-Item Env:\PD_DEBUG_RESIDUAL
 # 把本文件里的数字画成看板（分函数层级的堆叠条 + 线程扫描 + 成对对照 + Phase 3/4c/4d A/B
 #   + §八 剪切 / §九 弯曲 / §十 四套约束集的阶段构成 / §十一 采样变体 / §十二 惯性右端（已否）
 #   + 查看器时间线）
-node build\_perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
-node build\_perf\check_report.js          # 几何 + 新板块自检（用 DOM 桩真跑一遍渲染代码）
-node build\_perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
+node _perf\make_report.js          # 生成 build\_perf\perf-report.html（自包含，可直接双击打开）
+node _perf\check_report.js          # 几何 + 新板块自检（用 DOM 桩真跑一遍渲染代码）
+node _perf\serve.js                # 可选：静态服务，浏览器开 http://127.0.0.1:8137/
 
 # 全局步（回代）的可行性审计：性质 / 层集 / 换排序 / 并行原型（结论见 docs/solver-feasibility.md）
 .\build\Release\pd_solveaudit.exe --grid 200 200 --order amd --solves 40 --proto-threads 1,2,4,8
 
 # 回代改造（§8）的前后对照：基线（Eigen solve）/ 变体 A（CSR）/ 变体 B（scatter）交替取最小
-.\build\_perf\ab_solve.ps1 -Reps 5          # 日志写到 build\_baseline\solve_ab.log
+.\_perf\ab_solve.ps1 -Reps 5          # 日志写到 build\_baseline\solve_ab.log
 
 # Phase 4c（§9）的三分量拆分：结构自检 + 逐位比对 + 区域内交替微基准
 .\build\Release\pd_solvecomp.exe --grid  40  40 --reps 200 --threads 4
@@ -1192,28 +1192,28 @@ node build\_perf\serve.js                # 可选：静态服务，浏览器开 
 .\build\Release\pd_bench.exe           --grid 40 40 --steps 300 --iters 40 --residual-tol 0.3 --threads 4
 
 # 弯曲约束（§12）的成对 A/B：同一轮会话内交替 5 次取最小值（开/关分别取最小）
-.\build\_perf\ab_bend.ps1 -Reps 5 -Bend 1000        # 日志：build\_baseline\bend_ab.log
+.\_perf\ab_bend.ps1 -Reps 5 -Bend 1000        # 日志：build\_baseline\bend_ab.log
 
 # 弯曲 stencil 采样变体（§13）的降本对照：off / 全采样 / 单向 / 棋盘 / 隔行 × 刚度补偿
-.\build\_perf\ab_bend_variants.ps1 -Reps 5          # 日志：build\_baseline\bend_variants_ab.log
+.\_perf\ab_bend_variants.ps1 -Reps 5          # 日志：build\_baseline\bend_variants_ab.log
 
 # 四套约束集的阶段构成（看板 §十）：默认 / 只剪切 / 只弯曲 / 两者都开
-.\build\_perf\constraint_sets.ps1 -Reps 3           # 日志：build\_perf\logs_cs\（原样 pd_bench 输出）
+.\_perf\constraint_sets.ps1 -Reps 3           # 日志：build\_perf\logs_cs\（原样 pd_bench 输出）
 
 # 惯性右端并行化（§14）的三方 A/B：旧-single / 控制-single / 新-for（7 次交替取最小）
 #   ⚠ 源码已回退 ⇒ 现在跑它两端是同一份代码（差值应 ≈ 0）；要重做实验先把 §14 那几行改回去
-.\build\_perf\ab_inertial.ps1 -Reps 7               # 日志：build\_baseline\inertial_ab3.log
+.\_perf\ab_inertial.ps1 -Reps 7               # 日志：build\_baseline\inertial_ab3.log
 
 # Phase 4c 的看板数据刷新（① 线程扫描 ② phase4c A/B ③ 剪切/弯曲/采样变体 A/B ④ 四套约束集）
 #   → 重生成 → 自检 → 起静态服务
-.\build\_perf\refresh_report.ps1            # 约 6 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
-.\build\_perf\refresh_report.ps1 -SweepOnly # 只重采 ① 线程扫描 + ④ 四套约束集（②③ 的 A/B 面板不动）
+.\_perf\refresh_report.ps1            # 约 6 分钟；-SkipSweep 只重跑 A/B；-Reps N 调重复次数
+.\_perf\refresh_report.ps1 -SweepOnly # 只重采 ① 线程扫描 + ④ 四套约束集（②③ 的 A/B 面板不动）
 #   ⚠️ 线程扫描是**逐轮交替**（轮次在最外层，每轮把 5 个线程档背靠背跑完，`-SweepReps` 默认 3 轮，
 #   跨轮取最小值）—— 旧写法"一个档连跑 2 次再换下一档"会让机器漂移系统性偏袒某一档，
 #   看板的"最优线程"标签因此不可信（2026-09-24 改；当时 100×100 被标成 8T，同会话交替复测是 4T）。
-node build\_perf\make_report.js             # 生成 build\_perf\perf-report.html
-node build\_perf\check_report.js            # 自检（段数 / 越界 / 标尺文本 + 新板块非空与关键数字反查）
-node build\_perf\serve.js                   # http://127.0.0.1:8137/
+node _perf\make_report.js             # 生成 build\_perf\perf-report.html
+node _perf\check_report.js            # 自检（段数 / 越界 / 标尺文本 + 新板块非空与关键数字反查）
+node _perf\serve.js                   # http://127.0.0.1:8137/
 ```
 
 > **看板各板块的数据来源**（改脚本时这几对数不能脱钩）：

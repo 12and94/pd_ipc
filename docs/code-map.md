@@ -28,10 +28,11 @@ cd D:\dsh_workspace\pd_ipc
   7 数值分解次数 == 1          OK
   8 弹性力符号 == -dU/dy        OK
 
-  全部正确（失败 0 项）
+  全部正确（8 项，失败 0 项）
 ```
 
-退出码 0 = 全对，1 = 有错（可用于 CI）。
+退出码 0 = 全对，1 = 有错（可用于 CI）。**收尾那行会自报项数**（2026-09-24 起）：
+这样"8 项"这个数字有唯一来源，文档不必手抄 —— `tools/check.ps1` 会拿它去核对文档里的口径句。
 
 **关于第 3 项为什么是 $\ell-mg/\kappa$（曾经的判断错误，务必注意）**
 
@@ -149,6 +150,24 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 ---
 
+### 2.8 性能工具（`_perf/`，2026-09-24 起纳入版本控制）
+
+| 文件 | 用途 |
+|---|---|
+| `tools/check.ps1` | **一条命令的验收集 + 门禁**（M4 回归固化）：跑完全部验收程序、把程序**自报的计数**与文档口径句对账、编码门禁（`*.ps1` 带 BOM / 文本无 BOM + LF）、默认约束集物理输出与存档基线**逐字比对**、看板自检。改动前后各跑一次 |
+| `_perf/make_report.js` | 从 `build/_perf/logs` 与 `build/_baseline/` 的日志生成看板 `build/_perf/perf-report.html`（自包含；每节标题下自动印"采集时间"） |
+| `_perf/check_report.js` | 看板自检：用最小 DOM 桩**真跑一遍客户端渲染代码**，量条形是否越界、反查关键数字（含"采集时间 12 行"） |
+| `_perf/serve.js` | 把产物目录 `build/_perf/` 起成静态服务（http://127.0.0.1:8137/） |
+| `_perf/refresh_report.ps1` | 刷新看板数据：① 线程扫描（**逐轮交替**，`-SweepReps` 默认 3）② Phase 4c A/B ③ 剪切/弯曲/采样变体 A/B ④ 四套约束集；`-SweepOnly` 只重采 ①+④ |
+| `_perf/ab_*.ps1` | 各阶段的成对 A/B 测量（同轮交替取最小值），日志写到 `build/_baseline/` |
+| `_perf/constraint_sets.ps1` | 四套约束集的阶段构成，日志写到 `build/_perf/logs_cs/` |
+| `_perf/HANDOFF.md` | 交接说明（含"已知的坑"） |
+
+> **脚本在 `_perf/`（版本控制），产物在 `build/_perf/`（gitignore）**：日志、看板 HTML、
+> 存档二进制都不进仓库。所有 `.ps1` **必须带 UTF-8 BOM**（`tools/check.ps1` 会查）。
+
+---
+
 ## 3. 运行与验证命令
 
 ```powershell
@@ -156,8 +175,11 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 .\tools\build.ps1
 .\tools\build.ps1 -Clean      # 清理后重建
 
+# ★ 一条命令的验收集 + 门禁（先跑这个；下面的是单项，便于排查）
+.\tools\check.ps1             # exit 0 = 全绿
+
 # ---- 验收（只看对错）----
-.\build\Release\pd_check.exe          # 8 项，退出码 0/1
+.\build\Release\pd_check.exe          # 8 项，退出码 0/1（末行会自报项数）
 #   1 投影长度 == 静止长度        5 自由落体一步 == -h²g
 #   2 单步解 == 闭式解            6 布料有界
 #   3 静止平衡 == ℓ - m g/κ       7 数值分解次数 == 1

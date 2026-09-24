@@ -7,7 +7,7 @@
 > **怎么用**：§1 是机会（按预估收益排序），§2 是问题（按严重度排序），§3 是**已被实测否掉的方向**
 > （别再重复投入），§4 是建议顺序。
 > 所有数字都来自 `docs/perf.md`（§8 Phase 4b / §9 Phase 4c / §10 Phase 4d / **§11 剪切 / §12 弯曲** / §6 线程标定）、
-> `docs/solver-feasibility.md`，以及 `build/_perf/` 下的看板与日志。
+> `docs/solver-feasibility.md`，以及 `_perf/` 下的看板与日志。
 
 ---
 
@@ -257,7 +257,7 @@
 - **是什么**：Phase 4c 之前该桶是 `omp single` 里"唯一执行者自己的执行时间"（**不含** barrier 等待）；
   现在是按分量 `omp for` 之后的**阶段墙钟**（**含**等最慢的那条线程）。
 - **影响**：引用历史上"回代占 76 %"之类的数字时会得出错误结论。
-- **现状**：已在 `docs/perf.md` §9.6、`build/_perf/HANDOFF.md` 坑 12、看板第六章注明。
+- **现状**：已在 `docs/perf.md` §9.6、`_perf/HANDOFF.md` 坑 12、看板第六章注明。
   引用时必须写明口径。
 
 ### 2.5 `solveComponent` 的不 resize 契约
@@ -408,5 +408,5 @@
 - `docs/solver-feasibility.md` —— 回代的延迟/带宽性质、层集与关键路径、被否掉的并行方案、迭代预算实测
 - `docs/parallel-refactor.md` —— 并行改造的阶段表（含 Phase 4a/4b/4c 与每阶段验收）
 - `docs/plan.md` —— §2.4(6) 与 D12 有"全局步并行"的历史决策与 2026-09-22 的补注
-- `build/_perf/HANDOFF.md` —— 交接说明（含"已知的坑"）
-- 看板：`build/_perf/perf-report.html`（`node build/_perf/serve.js` → http://127.0.0.1:8137/）
+- `_perf/HANDOFF.md` —— 交接说明（含"已知的坑"）
+- 看板：`build/_perf/perf-report.html`（`node _perf/serve.js` → http://127.0.0.1:8137/）

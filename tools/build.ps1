@@ -1,4 +1,4 @@
-param(
+﻿param(
   [switch]$DebugTools,
   [switch]$Clean,
   [string]$Config = "Release",

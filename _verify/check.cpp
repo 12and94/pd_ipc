@@ -29,8 +29,10 @@ using namespace pd;
 namespace {
 
 int g_failed = 0;
+int g_total = 0;   // 检查项总数：打印出来，让"8 项"这个数字有唯一的权威来源（文档不必手抄）
 
 void item(const char* name, bool ok, double got, double want, double tol) {
+  ++g_total;
   std::printf("  %-34s %s", name, ok ? "OK" : "NG");
   if (!ok) {
     std::printf("     实测 %.10g  期望 %.10g  容差 %.3g", got, want, tol);
@@ -241,6 +243,6 @@ int main() {
     item("8 弹性力符号 == -dU/dy", allOk, worstGot, worstWant, 1e-6);
   }
 
-  std::printf("\n  %s（失败 %d 项）\n", g_failed == 0 ? "全部正确" : "存在错误", g_failed);
+  std::printf("\n  %s（%d 项，失败 %d 项）\n", g_failed == 0 ? "全部正确" : "存在错误", g_total, g_failed);
   return g_failed == 0 ? 0 : 1;
 }

@@ -1,4 +1,4 @@
-﻿#include <cmath>
+#include <cmath>
 #include <cstdio>
 #include "core/sim/Integrator.h"
 #include "core/sim/Scene.h"

@@ -57,7 +57,10 @@
 .\tools\build.ps1                 # 配置 + Release 构建
 .\tools\build.ps1 -Clean          # 清理后重建
 
-# 验收（最常用的一组，全部应 exit 0）
+# ★ 一条命令跑完全部验收（2026-09-24 起）：验收集 + 编码门禁 + 文档数字对账 + 物理基线逐字比对
+.\tools\check.ps1                 # exit 0 = 全绿；失败项逐条打印
+
+# 下面这些是"单项"，check.ps1 已经全部覆盖；列出来便于单独排查
 .\build\Release\pd_check.exe               # 端到端 8 项验收
 .\build\Release\test_primitives.exe        # 距离约束的定义级不变量
 .\build\Release\test_spring_vertical.exe   # 两顶点弹簧逐步对照
@@ -72,6 +75,13 @@
 .\build\Release\pd_viewer.exe
 .\build\Release\pd_viewer.exe --pin-single --grid 30 30   # 只钉一个角
 ```
+
+> **`tools/check.ps1` 做什么**（M4 回归固化）：① 跑完验收集，任一程序非 0 退出即失败；
+> ② 把每个程序**自报的计数**（`403`/`233`/`155`/`15`/`8 项`/`22 条`）抽出来，与文档里"当前计数"
+> 的口径句**逐处比对** —— 数字漂了会直接报错（历史段落里的旧数字**故意不管**）；
+> ③ 编码门禁：所有跟踪的 `*.ps1` 必须带 UTF-8 BOM、其余跟踪文本必须 UTF-8 无 BOM + LF；
+> ④ 默认约束集的物理输出必须与存档基线 `pd_bench_pre_fuse.exe` **逐字相同**；
+> ⑤ 看板 HTML 存在时跑一遍 `_perf/check_report.js`。**改动前后各跑一次是本仓库的约定。**
 
 查看器交互：左键拖拽旋转 / 滚轮缩放 / `SPACE` 暂停 / `S` 单步 / `G` 重力开关 / `R` 重置 /
 `[` `]` 调刚度 / `-` `=` 调迭代数 / `,` `.` 调子步数 / `;` `'` 调线程数 / `ESC` 退出。
