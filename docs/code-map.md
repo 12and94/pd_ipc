@@ -3,6 +3,7 @@
 > 本文档只讲两件事：**每部分代码在哪**、**怎么运行并看结果**。
 > 计划与设计见 `docs/plan.md`，进度与现象记录见 `README.md`，
 > **收敛问题的成因与刚度标定见 `docs/pd-convergence.md`**，
+> **运行效率与公开数据对照的接手说明（材料、命令、参数、残差口径、状态）见 `docs/convergence-speed-handoff.md`**，
 > **Chebyshev 加速的原理与落地形态（含我们该开/不该开的时机）见 `docs/chebyshev.md`**，
 > **Chebyshev 加速已实现（v1，默认关）：`PD_CHEB=1` 打开，`PD_CHEB_RHO`（默认 0.98）、`PD_CHEB_START`（默认 10）；实测同预算下残差 −14 %～−43 %**，
 > **并行改造方案见 `docs/parallel-refactor.md`（Phase 1 已实施）、性能记录见 `docs/perf.md`**，
