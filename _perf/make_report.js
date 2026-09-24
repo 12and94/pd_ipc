@@ -417,7 +417,8 @@ hover 图形可看精确数值。<br>
   同一参数两次运行可差 ~1.7×（1T/200×200 实测 123.6 / 132.7 / 138.6 ms，而
   <code>PD_AFFINITY=workers</code> 钉核后是 76.7 / 72.9 / 76.1 ms）。落点像是 P-core 还是 E-core 的差别
   ⇒ <b>别用这两档下并发结论</b>；要看 1T/2T 请用 <code>PD_AFFINITY=workers</code> 并注明。
-  4T/8T <b>不要</b>开亲和性（实测 4T 上 +4.7 % / +8.9 % 更慢）。<br>
+  亲和性要看<b>运行长度</b>：短跑（&lt;5 s）无所谓（±2 %），<b>长跑（&gt;10 s）必须钉核</b>
+  —— 200×200/iters40 实测 229.0 → 132.3 ms（−42 %，<code>PD_AFFINITY=exclusive</code>）。<br>
   ⚠️ 但它仍然只是"这一轮日志里最小"：各档之间差几个百分点就是噪声；而且<b>组内可比、组间不可比</b>
   （别的节来自别的会话）。默认线程数是<b>机器相关参数</b>（<code>min(hw−2, 4)</code>，本机 = 4），
   换机器或换量级必须重标定 —— 见 <code>docs/open-issues.md</code> §0 与 <code>HANDOFF.md</code> §4。

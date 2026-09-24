@@ -177,6 +177,63 @@ if ($sf) {
   else { Bad 'pd_sharefactor：单份求解与各份求解不再逐位相同' }
 }
 
+# ---------------------------------------------------------------------------
+# ⑥ 迭代预算三档预设（docs/perf.md §18）：唯一权威是 core/sim/Scene.h 的 iterationPresetTable()。
+# 做法与其他"数字权威化"一致：让**程序自己报**每个档位的生效值，再要求文档那张表写着同样的数。
+# 这样"档位被改"和"文档没跟着改"都会红。顺手验两条容易悄悄坏的性质：
+#   ① --preset 真的生效（而不是被忽略）；② 不写 --preset 时**维持库默认**（10 次 / 1e-3）——
+#   后者是全部历史基线（含第 ④ 步的物理逐字比对）的前提，谁改了默认值这里就会响。
+$presetWant = @{ 'preview' = @(20, '0.3'); 'realtime' = @(40, '0.3'); 'accurate' = @(80, '0.001') }
+$presetGot = @{}
+foreach ($name in @('preview', 'realtime', 'accurate')) {
+  $r = RunExe 'pd_bench' @('--preset', $name, '--grid', '20', '20', '--steps', '1')
+  if (-not $r) { continue }
+  if ($r.Code -ne 0) { Bad "pd_bench --preset $name exit=$($r.Code)"; continue }
+  $mi = [regex]::Match($r.Out, 'PD 迭代上限 (\d+)')
+  $mt = [regex]::Match($r.Out, '残差容差 ([\d.eE+-]+)')
+  if (-not $mi.Success -or -not $mt.Success) { Bad "没抓到 --preset $name 的自报值（表头格式变了？）"; continue }
+  $gotIters = [int]$mi.Groups[1].Value
+  $gotTol = [double]$mt.Groups[1].Value
+  $want = $presetWant[$name]
+  if ($gotIters -ne $want[0] -or [math]::Abs($gotTol - [double]$want[1]) -gt 1e-12) {
+    Bad "档位 $name 自报 $gotIters 次 / $gotTol，与门禁基准 $($want[0]) 次 / $($want[1]) 不一致"
+  } else {
+    $presetGot[$name] = @($gotIters, $want[1])
+  }
+}
+if ($presetGot.Count -eq 3) {
+  Good '三档自报与基准一致（preview 20/0.3、realtime 40/0.3、accurate 80/1e-3）'
+} else {
+  Bad "三档没有全部自报成功（只拿到 $($presetGot.Count) 个）"
+}
+$rd = RunExe 'pd_bench' @('--grid', '20', '20', '--steps', '1')
+if ($rd -and $rd.Code -eq 0) {
+  if ($rd.Out -match 'PD 迭代上限 10' -and $rd.Out -match '残差容差 0\.001') {
+    Good '不写 --preset 时维持库默认（10 次 / 1e-3）⇒ 历史基线口径不变'
+  } else {
+    Bad '不写 --preset 的默认值变了 —— 会破坏全部历史基线的时间口径'
+  }
+}
+# 文档那张表必须写着程序自报的数（容忍 1e-3 的几种写法）
+$perfPath = Join-Path $root 'docs\perf.md'
+if (Test-Path $perfPath) {
+  $perfLines = [IO.File]::ReadAllLines($perfPath, [Text.Encoding]::UTF8)
+  foreach ($name in @('preview', 'realtime', 'accurate')) {
+    if (-not $presetGot.ContainsKey($name)) { continue }
+    $iters = [string]$presetGot[$name][0]
+    $tolStr = $presetGot[$name][1]
+    $tolAlt = if ($tolStr -eq '0.001') { @('1e-3', '1E-3', '0.001') } else { @($tolStr) }
+    $found = $false
+    foreach ($line in $perfLines) {
+      if ($line -notmatch ('`' + $name + '`')) { continue }
+      if ($line -notmatch ('\|\s*' + $iters + '\s*\|')) { continue }
+      foreach ($alt in $tolAlt) { if ($line.Contains($alt)) { $found = $true } }
+    }
+    if ($found) { Good "perf.md §18 档位表：$name = $iters 次 / $tolStr" }
+    else { Bad "perf.md §18 档位表里 $name 那一行与程序自报（$iters 次 / $tolStr）不一致" }
+  }
+}
+
 # ---------------------------------------------------------------- ③ 编码门禁
 if (-not $NoBuildCheck) {
   Step '③ 编码门禁：*.ps1 必须带 BOM；跟踪文本必须 UTF-8 无 BOM + LF'

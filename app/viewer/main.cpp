@@ -421,6 +421,12 @@ int main(int argc, char** argv) {
   // 详见 docs/pd-convergence.md 4.3 节。
   double tol = 1.0e-5;          // 位移判据（需要更严时用它）
   double residualTol = 3.0e-1;  // 残差判据：0.3 × |g|
+  // 迭代预算档位（docs/perf.md §18）：上面的 iters=40 / residualTol=0.3 正是 `realtime` 档。
+  // 档位先落、显式 --iters/--residual-tol 再覆盖，与命令行顺序无关。
+  bool havePreset = false;
+  IterationPreset preset = IterationPreset::Realtime;
+  bool explicitIters = false;
+  bool explicitResidualTol = false;
   double damping = 0.02;
   bool noEarlyExit = false;     // 关闭全部提前退出，强制每子步跑满 --iters
   double dt = 1.0 / 120.0;      // 子步长 h
@@ -433,10 +439,18 @@ int main(int argc, char** argv) {
     else if (a == "--stiffness" && i + 1 < argc) stiffness = std::atof(argv[++i]);
     else if (a == "--pin-corners") pinTopEdge = false;
     else if (a == "--pin-single") { pinTopEdge = false; pinSingle = true; }
-    else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
+    else if (a == "--iters" && i + 1 < argc) { iters = std::atoi(argv[++i]); explicitIters = true; }
+    else if (a == "--preset" && i + 1 < argc) {
+      if (!parseIterationPreset(argv[i + 1], preset)) {
+        std::fprintf(stderr, "--preset 只认这些档位：%s\n", iterationPresetList().c_str());
+        return 2;
+      }
+      ++i;
+      havePreset = true;
+    }
     else if (a == "--tol" && i + 1 < argc) tol = std::atof(argv[++i]);
     else if (a == "--damping" && i + 1 < argc) damping = std::atof(argv[++i]);
-    else if (a == "--residual-tol" && i + 1 < argc) residualTol = std::atof(argv[++i]);
+    else if (a == "--residual-tol" && i + 1 < argc) { residualTol = std::atof(argv[++i]); explicitResidualTol = true; }
     else if (a == "--dt" && i + 1 < argc) dt = std::atof(argv[++i]);
     else if (a == "--size" && i + 2 < argc) { winW = std::atoi(argv[++i]); winH = std::atoi(argv[++i]); }
     else if (a == "--pos" && i + 2 < argc) {
@@ -451,6 +465,11 @@ int main(int argc, char** argv) {
           "  --grid N          网格边长（默认 60）\n"
           "  --stiffness K     刚度 κ（默认 2300，来自刚度标定，见 core/sim/Scene.h）\n"
           "  --iters N         每子步迭代上限（默认 40）\n"
+          "  --preset NAME     迭代预算档位（只改迭代上限 + 残差容差；见 docs/perf.md §18）：\n"
+          "                    preview = 20 次 / 0.3·|g|（更快、瞬态更糙）\n"
+          "                    realtime = 40 次 / 0.3·|g|（默认，与历史基线一致）\n"
+          "                    accurate = 80 次 / 1e-3（离线对照，不可实时）\n"
+          "                    显式 --iters / --residual-tol 覆盖档位，且与书写顺序无关\n"
           "  --tol T           位移判据相对容差（默认 1e-5）。T=0 等价于 --no-early-exit。\n"
           "                    **残差判据启用时它是唯一放行条件，调 --tol 不改变迭代数**\n"
           "  --residual-tol T  残差判据：不平衡力上限 = T×|g|（默认 0.3，实时档）；\n"
@@ -473,9 +492,27 @@ int main(int argc, char** argv) {
   //   对照实验实际上仍会提前退出，得出错误结论。)
   if (tol == 0.0) noEarlyExit = true;
 
-  std::printf("[参数] grid=%d frames=%d shot=%s stiffness=%g iters=%d tol=%g residual_tol=%g damping=%g%s\n",
+  // 迭代预算档位：**必须在 [参数] 行之前落定**，否则那行会打印档位默认值而不是生效值（会骗人）。
+  // 显式 --iters / --residual-tol 覆盖档位，与命令行顺序无关。
+  if (havePreset) {
+    SceneConfig p;
+    applyIterationPreset(p, preset);
+    if (!explicitIters) iters = p.maxIterations;
+    if (!explicitResidualTol) residualTol = p.residualTolerance;
+  }
+
+  std::string presetTag;
+  if (havePreset) {
+    const IterationPresetInfo* t = iterationPresetTable();
+    const char* nm = (preset == IterationPreset::Preview)     ? t[0].name
+                     : (preset == IterationPreset::Realtime)  ? t[1].name
+                                                              : t[2].name;
+    presetTag = std::string(" preset=") + nm;
+  }
+  std::printf("[参数] grid=%d frames=%d shot=%s stiffness=%g iters=%d tol=%g residual_tol=%g damping=%g%s%s\n",
               gridN, maxFrames, shotPath.c_str(), stiffness, iters, tol,
-              noEarlyExit ? 0.0 : residualTol, damping, noEarlyExit ? " no-early-exit" : "");
+              noEarlyExit ? 0.0 : residualTol, damping, noEarlyExit ? " no-early-exit" : "",
+              presetTag.c_str());
 
   // 先建场景（无窗口也能验证物理链路）
   SceneConfig cfg;

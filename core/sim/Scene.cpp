@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "core/assemble/Assembler.h"
@@ -203,6 +204,53 @@ void refreshPinPositions(SimContext& ctx) {
   for (int v = 0; v < m.vertexCount(); ++v) {
     if (m.isPinned(v)) m.pinPositions[static_cast<std::size_t>(v)] = m.positions[static_cast<std::size_t>(v)];
   }
+}
+
+// ---------------------------------------------------------------- 迭代预算的预设档位
+// ⚠️ 这张表是**唯一权威**：CLI（pd_bench / pd_viewer）、文档（docs/perf.md §18、README §1）与
+//    门禁（tools\check.ps1 第 ⑥ 项）都对着它。改这里就必须同步改那三处，否则门禁会红。
+const IterationPresetInfo* iterationPresetTable() {
+  static const IterationPresetInfo kTable[] = {
+      {"preview", 20, 0.3, "预览档：迭代数减半，换帧率；弹性能与实时档差 ~0.5 %"},
+      {"realtime", 40, 0.3, "实时档（查看器默认，与历史基线一致）"},
+      {"accurate", 80, 1.0e-3, "精度档：离线对照 / 回归；瞬态明显更接近平衡"},
+      {nullptr, 0, 0.0, nullptr},
+  };
+  return kTable;
+}
+
+bool parseIterationPreset(const char* name, IterationPreset& out) {
+  if (name == nullptr) return false;
+  const IterationPresetInfo* t = iterationPresetTable();
+  for (int i = 0; t[i].name != nullptr; ++i) {
+    if (std::strcmp(t[i].name, name) == 0) {
+      switch (i) {
+        case 0: out = IterationPreset::Preview; return true;
+        case 1: out = IterationPreset::Realtime; return true;
+        default: out = IterationPreset::Accurate; return true;
+      }
+    }
+  }
+  return false;
+}
+
+void applyIterationPreset(SceneConfig& cfg, IterationPreset preset) {
+  const IterationPresetInfo* t = iterationPresetTable();
+  const int idx = (preset == IterationPreset::Preview) ? 0
+                  : (preset == IterationPreset::Realtime) ? 1
+                                                          : 2;
+  cfg.maxIterations = t[idx].maxIterations;
+  cfg.residualTolerance = t[idx].residualTolerance;
+}
+
+std::string iterationPresetList() {
+  std::string s;
+  const IterationPresetInfo* t = iterationPresetTable();
+  for (int i = 0; t[i].name != nullptr; ++i) {
+    if (!s.empty()) s += " | ";
+    s += t[i].name;
+  }
+  return s;
 }
 
 }  // namespace pd

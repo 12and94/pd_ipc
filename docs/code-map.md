@@ -69,8 +69,8 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 |---|---|---|
 | `core/mesh/Mesh.h/.cpp` | 顶点/速度/质量/pin 标记、边表（距离约束）、**弯曲 stencil 表**（`BendStencil` / `bends` / `addBendingStencils`）、**弯曲采样开关**（`BendSampling` / `BendGenOptions`：全采样默认，另有单向 / 棋盘 / 隔行 —— 实测结论见 `docs/perf.md` §13）、稀疏结构 `buildSparsityPattern()`、**约束着色与顶点关联表**（同一入口一并构建）、规则网格生成、OBJ 载入 | 6、7 |
 | `core/mesh/ConstraintColoring.h/.cpp` | 约束（边）的图着色：同色边两两不共享顶点 —— 散射据此按颜色分组执行，**无需归约/原子加**。并行 Jones–Plassmann（优先级哈希 + 最小可用颜色），颜色数 ≤ Δ+1，同色内按顶点序排列（避免假共享）。**拓扑级数据**，随 `buildSparsityPattern()` 构建。<br>**另有 `BendAdjacency`**（顶点→弯曲 stencil 的 CSR，带 `w_v ∈ {1,-2,1}`）与 `buildBendAdjacency()`：弯曲没有散射，这张表**只给残差**用（每个顶点独立算自己那份弯曲力），同样随 `buildSparsityPattern()` 构建 | 散射的正确性与性能；残差口径 |
-| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差 / **`shearStiffness` / `bendStiffness`：两个可选约束，默认 0 = 关闭** / **`bendSampling` / `bendStride`：弯曲 stencil 的采样开关，默认全采样**）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + **`bendRhs`** + 阶段耗时）、`StageTimes` | — |
-| `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()` | 6、7 |
+| `core/sim/Scene.h` | `SceneConfig`（dt / 重力 / 刚度 / 密度 / 阻尼 / 迭代数 / 容差 / **`shearStiffness` / `bendStiffness`：两个可选约束，默认 0 = 关闭** / **`bendSampling` / `bendStride`：弯曲 stencil 的采样开关，默认全采样**）、`SimContext`（网格 + 求解器 + 所有临时缓冲 + **`bendRhs`** + 阶段耗时）、`StageTimes`、**`iterationPresetTable()` / `parseIterationPreset()` / `applyIterationPreset()`：迭代预算三档预设**（`preview` 20 次·0.3 / `realtime` 40 次·0.3 / `accurate` 80 次·1e-3；只改 `maxIterations` + `residualTolerance`，库默认刻意不动 —— 见 `docs/perf.md` §18） | — |
+| `core/sim/Scene.cpp` | `makeScene()` 按配置建场景；`ensureBuffers()` 统一分配临时缓冲；`refreshPinPositions()`；三档预设的实现（`iterationPresetTable()` 是**唯一权威**，CLI/文档/门禁都对着它） | 6、7 |
 
 > **`pinPositions` 契约（踩过坑）**：一旦 `mesh.pinned` 里有 1，`pinPositions` 就必须按顶点数填好，
 > 因为散射阶段要读 `pinPositions[pin]` 做消元补偿。正常流程由 `makeScene` / `refreshPinPositions`
@@ -155,7 +155,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 | 文件 | 用途 |
 |---|---|
-| `tools/check.ps1` | **一条命令的验收集 + 门禁**（M4 回归固化）：跑完全部验收程序、把程序**自报的计数**与文档口径句对账、编码门禁（`*.ps1` 带 BOM / 文本无 BOM + LF）、默认约束集物理输出与存档基线**逐字比对**、看板自检。改动前后各跑一次 |
+| `tools/check.ps1` | **一条命令的验收集 + 门禁**（M4 回归固化）：跑完全部验收程序、把程序**自报的计数**与文档口径句对账、编码门禁（`*.ps1` 带 BOM / 文本无 BOM + LF）、默认约束集物理输出与存档基线**逐字比对**、看板自检、**迭代预算三档预设自报 == 文档表 == 门禁基准**（含"不写 `--preset` 时维持库默认 10 次 / 1e-3"这条保护历史基线的性质）。改动前后各跑一次 |
 | `_perf/make_report.js` | 从 `build/_perf/logs` 与 `build/_baseline/` 的日志生成看板 `build/_perf/perf-report.html`（自包含；每节标题下自动印"采集时间"） |
 | `_perf/check_report.js` | 看板自检：用最小 DOM 桩**真跑一遍客户端渲染代码**，量条形是否越界、反查关键数字（含"采集时间 12 行"） |
 | `_perf/serve.js` | 把产物目录 `build/_perf/` 起成静态服务（http://127.0.0.1:8137/） |
@@ -205,6 +205,12 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 
 # ---- 性能 ----
 .\build\Release\pd_bench.exe --grid 40 40 --steps 600 --iters 10
+# 迭代预算三档预设（2026-09-24）：瞬态残差到不了判据 ⇒ 迭代数是**硬截断**，"跑几次"按用途取档。
+#   --preset preview（20 次 / 0.3·|g|）/ realtime（40 / 0.3，查看器默认）/ accurate（80 / 1e-3）；
+#   显式 --iters / --residual-tol 覆盖档位（与书写顺序无关），不写 --preset 则维持库默认 10 次 / 1e-3。
+.\build\Release\pd_viewer.exe --preset preview --grid 60      # 换帧率
+# 代价与物理差异、以及一条更要紧的发现（**长跑必须钉核，否则慢 39–42 %**）：docs/perf.md §18
+.\build\Release\pd_bench.exe --preset realtime --grid 40 40 --steps 300
 # 收敛门槛：--residual-tol T 设的是**真正放行的那一个**（T×|g|，默认 1e-3）；
 # --tol 只改位移判据，而残差判据启用时位移判据不参与判定（调它不改变迭代数）。
 # 例：门槛与代价的因果（同工况 40×40 / 300 子步 / 上限 40，2026-09-21 实测）——

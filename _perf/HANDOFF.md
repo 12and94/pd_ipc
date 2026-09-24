@@ -65,6 +65,8 @@ cd D:\dsh_workspace\pd_ipc
 
 # 基准与查看器
 .\build\Release\pd_bench.exe --grid 40 40 --steps 300 --iters 40 --residual-tol 0.3 --threads 4
+#   ↑ 等价于 `--preset realtime`。三档预设 preview(20)/realtime(40)/accurate(80) 见 docs/perf.md §18；
+#     不写 --preset 时维持库默认（10 次 / 1e-3）⇒ 历史基线口径不变。
 .\build\Release\pd_viewer.exe --frames 400
 ```
 
@@ -161,8 +163,10 @@ ab_bend_variants, ab_inertial, constraint_sets, refresh_report}.ps1`（**都必�
   **2026-09-24 起还是"三条线程读同一份因子"**（§16）⇒ 200×200 那一档回代再降 54 %。
   线程扫描（2026-09-24 重采，**100×100/200×200 的子步数由 20/8 提到 100**、逐轮交替 3 轮取最小）：
   4T 在四个工况都是最优 —— 40×40 **2.569**、60×60 **0.368**、100×100 **4.499**、200×200 **26.619** ms/子步。
-  ⚠️ **1T/2T 两档不可信**（双峰：1T/200×200 实测 123.6–138.6 ms vs `PD_AFFINITY=workers` 72.9–76.7 ms）；
-  4T/8T 不要开亲和性（4T 上 workers +4.7 %、exclusive +8.9 %）。
+  ⚠️ **1T/2T 两档不可信**（双峰：1T/200×200 实测 123.6–138.6 ms vs `PD_AFFINITY=workers` 72.9–76.7 ms）。
+  ⚠️ **亲和性看运行长度**：短跑（<5 s）无所谓（±2 %）；**长跑（>10 s）必须钉核** ——
+  200×200/iters40 实测 229.0 → 132.3 ms（**−42 %**，`PD_AFFINITY=exclusive`），
+  因为跑久了会有求解线程被挪到 E-core。见 `docs/perf.md` §18.4。
   单次已快 2.0–2.8×。再往上只有两条路：① 继续拆 solve（分块流水，收益未知）；
   ② **减少迭代数**（40→20 = 总时间 −49%，弹性能差 0.5 %，见 solver-feasibility §6）——
   后者量级大得多，但要按用途拍板。

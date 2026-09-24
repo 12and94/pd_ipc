@@ -196,6 +196,43 @@ struct SimContext {
 /// 否则 stepOnce 会在未分配的缓冲上越界 —— 这是实际踩过的坑，故做成显式且自保护的接口。
 void ensureBuffers(SimContext& ctx);
 
+// ---------------------------------------------------------------- 迭代预算的预设档位
+//
+// **为什么需要"档位"而不是"一个能调到收敛的参数"**：瞬态残差**永远到不了判据**
+// （实测 400 次迭代后仍停在 5.7 m/s²，判据是 0.3·|g| = 2.943，每次迭代只降 ~0.3 %），
+// 所以 `maxIterations` 是一个**硬截断**：它直接就是"这一帧花多少时间"的旋钮。
+// 实测（40×40 / 300 子步）40 → 20 次迭代 = 总时间 **−49 %**，而弹性能只差 0.5 %。
+// 因此正确做法是**按用途分档**，而不是锁死一个值，也不是指望它收敛。
+//
+// 三档（数值见 `docs/perf.md` §18；库默认 `SceneConfig` 不动 = 10 次 / 1e-3，
+// 那是"不设档位"时的既有行为，改动它会破坏所有历史基线）：
+//   `preview`   —— 换帧率：迭代数减半，物理略糙（弹性能差 ~0.5 %）
+//   `realtime`  —— 查看器默认（与历史基线一致）：40 次 / 0.3·|g|
+//   `accurate`  —— 离线对照 / 回归：80 次 / 1e-3，瞬态明显更接近平衡
+//
+// ⚠️ **档位只改 `maxIterations` 与 `residualTolerance` 两个字段**，其它一律不动 ——
+// 这样"档位"与"物理参数"（刚度/阻尼/dt/pin）在代码里就是分开的两件事。
+enum class IterationPreset { Preview, Realtime, Accurate };
+
+struct IterationPresetInfo {
+  const char* name;              ///< CLI 用的名字
+  int maxIterations;             ///< 每子步最大迭代数
+  Scalar residualTolerance;      ///< 残差判据（×|g|）
+  const char* note;              ///< 一句话用途
+};
+
+/// 档位表；以 `name == nullptr` 结尾（供打印与自检遍历）。
+const IterationPresetInfo* iterationPresetTable();
+
+/// 解析档位名（大小写敏感，与表里的名字逐字相同）；失败返回 false 且不改 out。
+bool parseIterationPreset(const char* name, IterationPreset& out);
+
+/// 把档位写进配置（只改 maxIterations 与 residualTolerance）。
+void applyIterationPreset(SceneConfig& cfg, IterationPreset preset);
+
+/// 所有档位的名字，一行一个（用于 CLI 的用法说明）。
+std::string iterationPresetList();
+
 /// 按配置构建场景：生成或载入网格、设置质量/pin/刚度、创建求解器。
 SimContext makeScene(const SceneConfig& config);
 

@@ -31,6 +31,11 @@ void printUsage() {
       "  --density RHO       面密度（默认 1.0）\n"
       "  --damping KD        速度阻尼（默认 0.02）\n"
       "  --iters N           每子步最大 PD 迭代数（默认 10）\n"
+      "  --preset NAME       迭代预算档位（只改迭代上限 + 残差容差；见 docs/perf.md §18）：\n"
+      "                      preview = 20 次 / 0.3·|g|（换帧率）\n"
+      "                      realtime = 40 次 / 0.3·|g|（查看器默认，与历史基线一致）\n"
+      "                      accurate = 80 次 / 1e-3（离线对照 / 回归）\n"
+      "                      显式 --iters / --residual-tol 覆盖档位，且与书写顺序无关\n"
       "  --residual-tol T    残差判据：不平衡力上限 = T×|g|（默认 1e-3）。<=0 表示禁用\n"
       "  --tol T             位移判据：相对容差 relTolerance（默认 1e-3）\n"
       "                      **注意：残差判据启用（residualTolerance>0）时它是唯一放行条件，\n"
@@ -56,6 +61,12 @@ int main(int argc, char** argv) {
   int steps = 600;
   int threads = 0;
   bool pinAll = false;
+  // 迭代预算档位（docs/perf.md §18）：档位先落，显式 --iters / --residual-tol 再覆盖，
+  // 这样与命令行的书写顺序无关。不写 --preset 就完全维持既有默认（10 次 / 1e-3）。
+  bool havePreset = false;
+  IterationPreset preset = IterationPreset::Realtime;
+  bool explicitIters = false;
+  bool explicitResidualTol = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -86,11 +97,22 @@ int main(int argc, char** argv) {
       next(cfg.velocityDamping);
     } else if (a == "--iters") {
       nextInt(cfg.maxIterations);
+      explicitIters = true;
+    } else if (a == "--preset") {
+      // 迭代预算档位：preview（20 次）/ realtime（40 次）/ accurate（80 次）。
+      // 瞬态残差到不了判据 ⇒ 迭代数是硬截断，"跑几次"就是个按用途取的选择。
+      if (i + 1 >= argc || !parseIterationPreset(argv[i + 1], preset)) {
+        std::fprintf(stderr, "--preset 只认这些档位：%s\n", iterationPresetList().c_str());
+        return 2;
+      }
+      ++i;
+      havePreset = true;
     } else if (a == "--residual-tol") {
       // 真正的放行判据（残差判据）。以前只能改 relTolerance，而它对迭代数
       // **完全无效** —— 残差判据启用时是唯一放行条件，于是基准无法复现
       // docs/pd-convergence.md §4.3 的"门槛 vs 代价"对照。
       next(cfg.residualTolerance);
+      explicitResidualTol = true;
     } else if (a == "--tol") {
       next(cfg.relTolerance);
     } else if (a == "--pin-top") {
@@ -107,6 +129,15 @@ int main(int argc, char** argv) {
     }
   }
 
+  // 档位先落，再让显式参数覆盖（与命令行顺序无关）
+  if (havePreset) {
+    const int keepIters = cfg.maxIterations;
+    const Scalar keepTol = cfg.residualTolerance;
+    applyIterationPreset(cfg, preset);
+    if (explicitIters) cfg.maxIterations = keepIters;
+    if (explicitResidualTol) cfg.residualTolerance = keepTol;
+  }
+
   if (threads > 0) setNumThreads(threads);
 
   SimContext ctx = makeScene(cfg);
@@ -120,6 +151,18 @@ int main(int argc, char** argv) {
               ctx.mesh.totalMass(), numThreads());
   std::printf("dt %.6g  子步/帧 %d  刚度 %.6g  PD 迭代上限 %d\n", cfg.dt, cfg.substepsPerFrame,
               cfg.stiffness, cfg.maxIterations);
+  // 迭代档位必须自报：日志要能自证"这一轮是哪个档位跑的"（档位会改迭代数 ⇒ 时间不可跨档比较）。
+  if (havePreset) {
+    const IterationPresetInfo* t = iterationPresetTable();
+    const char* nm = (preset == IterationPreset::Preview)     ? t[0].name
+                     : (preset == IterationPreset::Realtime)  ? t[1].name
+                                                              : t[2].name;
+    std::printf("迭代档位 %s%s\n", nm,
+                (explicitIters || explicitResidualTol) ? "（另有显式 --iters/--residual-tol 覆盖）" : "");
+  } else {
+    std::printf("迭代档位（未指定 --preset：用库默认 %d 次 / %.3g）\n", cfg.maxIterations,
+                cfg.residualTolerance);
+  }
   // 两个容差必须分别打印：它们不是"松/紧"的关系，而是"谁在放行"的关系。
   // 残差判据启用时位移判据完全不参与判定，只打印 relTolerance 会让人误以为调它有用。
   std::printf("位移容差 %.3g%s   残差容差 %.3g%s（不平衡力上限 = 容差×|g| = %.4g m/s²）\n",
