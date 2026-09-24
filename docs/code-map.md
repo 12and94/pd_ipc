@@ -143,7 +143,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 > `hang_test`、`init_audit`、`iteration_scan`、`scale_sweep`、`stiffness_calibration` 等。
 > 它们记录了当时的推理路径，可作追溯用，但结论请以 `pd_check` 与两个测试套件为准。
 
-这些程序**已全部纳入常规构建**：`CMakeLists.txt` 里各有 `add_executable`（**2026-09-24 实测 30 个目标**；
+这些程序**已全部纳入常规构建**：`CMakeLists.txt` 里各有 `add_executable`（**2026-09-24 实测 31 个目标**；
 写**目标数**、别写 `build\Release\` 下的 exe 数 —— 那里有 32 个，多出来的是历史残留产物），
 一次 `.\tools\build.ps1` 就全部产出到 `build\Release\`，**不需要手工再加构建行**。
 但它们**仍然不是受支持验收集**，部分前提假设已过期 —— 以 `README.md` §3 的验收集与
@@ -157,6 +157,7 @@ pinned 行被覆盖为（对角 1，右端 $q$）等价于消去该自由度，�
 |---|---|
 | `tools/check.ps1` | **一条命令的验收集 + 门禁**（M4 回归固化）：跑完全部验收程序、把程序**自报的计数**与文档口径句对账、编码门禁（`*.ps1` 带 BOM / 文本无 BOM + LF）、默认约束集物理输出与存档基线**逐字比对**、看板自检、**迭代预算三档预设自报 == 文档表 == 门禁基准**（含"不写 `--preset` 时维持库默认 10 次 / 1e-3"这条保护历史基线的性质）。改动前后各跑一次 |
 | `_perf/make_report.js` | 从 `build/_perf/logs` 与 `build/_baseline/` 的日志生成看板 `build/_perf/perf-report.html`（自包含；每节标题下自动印"采集时间"） |
+| `_verify/iteration_spectrum.cpp`（`pd_itspectrum`） | **判据 A：迭代算子谱 vs 实测**（不依赖文献的实现正确性判据）：线性化 `T = I − A⁻¹(M/h²+N)`、`B = I − T`，幂迭代给 `ρ(T)`、`λ_max(B)`、`λ_min(B)=1−ρ(T)`，并给出 Chebyshev 理论收缩率 `(√λmax−√λmin)/(√λmax+√λmin)`；同时用真实 `stepOnce` 测同一状态的收缩率做对照。自检：`solve(A·v)=v` + **pin 行右端必须清零**（不清零会给出理论上不可能的 ρ≈9194）。见 `docs/pd-convergence.md` §4.5 | — |
 | `_verify/residual_trace.cpp`（`pd_restrace`） | **残差-迭代曲线**诊断（对齐 Wang 2015 Fig.9 口径）：r0 手工复现「解全局步之前」的半次迭代，r_k 用**真实 `stepOnce`**（不复制生产循环）；同时给 max 与 **2 范数**（复算每顶点残差，并与生产的 `nonlinearResidual` **逐位互校**）。用途：把「我们收敛快不快」从「跟别人的图比」变成「同规模同口径比」—— 实测瞬态 10K 顶点 **1e-2 相对残差用 7 次迭代**、稳态则停滞在 ~0.998/次。见 `docs/pd-convergence.md` §4.4 ⑤ | — |
 | `_perf/check_report.js` | 看板自检：用最小 DOM 桩**真跑一遍客户端渲染代码**，量条形是否越界、反查关键数字（含"采集时间 12 行"） |
 | `_perf/serve.js` | 把产物目录 `build/_perf/` 起成静态服务（http://127.0.0.1:8137/） |
