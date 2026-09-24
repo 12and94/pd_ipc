@@ -3,13 +3,16 @@
 # 为什么需要它：验收集本来是"照着 HANDOFF §2 的清单逐条手跑"，于是"今天到底跑全了没有"
 # 只能靠人记；而文档里的数字（403 断言 / 22 条 / 8 项 / 233 …）都是**手抄**的，漂了没人知道。
 # 同一类债在 2026-09-23 与 09-24 连还了两轮（断言计数三种说法、README 查看器数字自相矛盾、
-# 脚本 BOM 丢失、看板口径与文档冲突…）。本脚本把四件事一次做完：
+# 脚本 BOM 丢失、看板口径与文档冲突…）。本脚本把六件事一次做完：
 #   ① 跑完验收集：任一程序非 0 退出即失败；
 #   ② 数字权威化：把每个程序**自报的计数**抽出来，再与文档里"当前计数"的口径句逐处比对；
 #   ③ 编码门禁：所有跟踪的 *.ps1 必须带 UTF-8 BOM；所有跟踪文本必须 UTF-8 无 BOM + LF；
 #   ④ 结构性回归：默认约束集的物理输出必须与存档基线 pd_bench_pre_fuse.exe **逐字相同**；
 #      看板 HTML 存在时再跑一遍 _perf/check_report.js（DOM 桩真跑渲染 + 关键数字反查）；
-#   ⑥ 另外反查两条"结构性前提"（pd_solvecomp / pd_sharefactor）：⊗ 结构不被破坏、
+#   ⑤ 迭代预算三档预设（docs/perf.md §18）的自报值 vs 文档表；
+#   ⑥ 文档命令一致性（2026-09-24 新增）：文档里出现的 `xxx.exe` 必须在 CMake 构建表内，
+#      且每个 `--flag` 必须在**该程序**接受的表内 —— 抓"程序没构建""参数名写错"这一类漂移；
+#      另外反查两条"结构性前提"（pd_solvecomp / pd_sharefactor）：⊗ 结构不被破坏、
 #      三分量因子切片同构且逐位相同、单份求解 == 各份求解。
 #
 # 用法： .\tools\check.ps1                 # 全部（约 10 秒，不含 A/B 测量）
@@ -307,8 +310,98 @@ if (Test-Path $html) {
   Note '没有看板 HTML，跳过（node _perf\make_report.js 生成）'
 }
 
-# ---------------------------------------------------------------- 汇总
-Write-Host ''
+# ---------------------------------------------------------------- ⑥ 文档命令一致性
+# 为什么需要它（2026-09-24）：上面五步都在比"文档里写的**数字**"，但没有一步在比
+# "文档里写的**命令**"。于是一整类漂移可以活很久而不红：
+#   · 文档点名了一个诊断程序，而它根本没进 CMake 的构建表（照文档复现会卡住）——
+#     实测抓到 `_verify/residual_audit.cpp` 等 3 个；
+#   · 文档给的参数在当前程序里不存在/写错（实测抓到 `--stiffness` 漏写导致整行数字对不上）。
+# 做法：把文档里出现的 `xxx.exe` 与它的 `--flag` 抽出来，比对
+#   ① 该程序必须在 CMakeLists.txt 的 add_executable 表里；② 每个 --flag 必须在该程序接受的表内。
+# **本步查不出的**（写在文档里而不是藏起来）：漏写 `$env:PD_SHEAR` 这类"命令对但环境缺一句"——
+# 那类只能靠口径声明，见 docs/convergence-speed-handoff.md §3 的警告。
+Step '⑥ 文档命令一致性：程序必须已构建、参数必须被接受'
+
+$allowedFlags = @{
+  'pd_bench'       = @('--grid','--steps','--iters','--stiffness','--residual-tol','--tol','--preset','--threads')
+  'pd_viewer'      = @('--grid','--iters','--stiffness','--residual-tol','--tol','--preset','--shot',
+                       '--pin-corners','--pin-single','--frames','--damping','--no-early-exit','--dt','--size','--pos')
+  'pd_restrace'    = @('--grid','--iters','--steps','--settle-iters','--stiffness','--spacing','--density',
+                       '--soft-mass','--dt','--damping','--traj','--traj-steps','--traj-ref','--pin')
+  'pd_itspectrum'  = @('--grid','--spacing','--density','--stiffness','--dt','--damping','--pin','--steps','--iters')
+  'pd_sharefactor' = @('--grid','--stiffness','--reps','--threads','--flush-mb')
+  'pd_solvecomp'   = @('--grid','--reps','--threads')
+}
+
+# CMake 建出来的可执行文件表（含别名：依赖缺失时会被跳过，但那属于构建期警告，不在这里报）
+$cmakeText = [IO.File]::ReadAllText((Join-Path $root 'CMakeLists.txt'), [Text.Encoding]::UTF8)
+$builtExes = @{}
+foreach ($m in [regex]::Matches($cmakeText, 'add_executable\(\s*(\w+)')) { $builtExes[$m.Groups[1].Value] = $true }
+
+$docSources = @('README.md') +
+  (Get-ChildItem (Join-Path $root 'docs')   -Filter *.md -ErrorAction SilentlyContinue | ForEach-Object { "docs\$($_.Name)" }) +
+  (Get-ChildItem (Join-Path $root '_perf')  -Filter *.md -ErrorAction SilentlyContinue | ForEach-Object { "_perf\$($_.Name)" })
+
+# ── **来源豁免表**：这些 .exe 被文档引用，但**本来就不该**出现在 CMakeLists.txt 里。
+# 第 ⑥ 步只对"应该由本项目构建"的程序报红；其余按来源分类豁免，避免把"正确的历史记录"判成漂移。
+# 判据不是"漏了就豁免" —— 每条都写了它是**哪来的**。新增文档引用外部工具时在此加一行。
+$externallyBuilt = @{
+  # 外部工具链（不是本项目的目标）
+  'glslc'                  = 'Vulkan SDK 的着色器编译器（docs/environment.md）'
+  'ninja'                  = '构建工具本身（docs/environment.md）'
+  'vk_probe'               = 'tools/ 下手工编译的 Vulkan 探测程序（docs/environment.md）'
+  'x'                      = '论文源码里的工程名，不是本项目目标（handoff §4）'
+  # 论文发布代码的本地 harness（%TEMP%\chebsim\，见 handoff §5，不进版本控制）
+  'cheb_test'              = '论文源码副本的 harness（handoff §5.2）'
+  # 存档基线二进制：	ools/check.ps1 第 ④ 步正是拿它做逐字比对
+  'pd_bench_pre_fuse'      = '存档基线（build\_baseline\，第 ④ 步的比对对象），不重新构建'
+  # 历史性能对照二进制：一次性测量用，见 docs/perf.md 的记录
+  'pd_bench_a_csr'         = 'perf.md 的历史 A/B 二进制'
+  'pd_bench_ctrl_single'   = 'perf.md 的历史 A/B 二进制'
+  'pd_bench_phase2'        = 'perf.md 的历史 A/B 二进制'
+  'pd_bench_pre_comp'      = 'perf.md 的历史 A/B 二进制'
+  'pd_bench_pre_sharefactor' = 'perf.md 的历史 A/B 二进制'
+}
+$refExes = @{}      # exe -> 首次出现的文件
+$badFlags = @{}
+foreach ($rel in $docSources) {
+  $p = Join-Path $root $rel
+  if (-not (Test-Path $p)) { continue }
+  $text = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+  foreach ($m in [regex]::Matches($text, '([A-Za-z_][A-Za-z0-9_]*)\.exe')) {
+    $name = $m.Groups[1].Value
+    if (-not $refExes.ContainsKey($name)) { $refExes[$name] = $rel }
+  }
+  # 抽参数：只取"程序名之后、行尾之前"的 --word，且只对该程序有表时才检查
+  foreach ($cm in [regex]::Matches($text, '([A-Za-z_][A-Za-z0-9_]*)\.exe([^\r\n]*)')) {
+    $name = $cm.Groups[1].Value
+    if (-not $allowedFlags.ContainsKey($name)) { continue }
+    if ($externallyBuilt.ContainsKey($name)) { continue }   # 豁免项不查参数
+    foreach ($fm in [regex]::Matches($cm.Groups[2].Value, '(?<![\w-])(--[A-Za-z][A-Za-z0-9-]*)')) {
+      $flag = $fm.Groups[1].Value
+      if ($allowedFlags[$name] -notcontains $flag) {
+        $badFlags["$rel :: $name $flag"] = $true
+      }
+    }
+  }
+}
+
+$missingExe = @($refExes.Keys | Where-Object { -not $builtExes.ContainsKey($_) -and -not $externallyBuilt.ContainsKey($_) } | Sort-Object)
+if ($missingExe.Count -eq 0) {
+  Good "文档引用的 $($refExes.Count) 个程序全部在 CMake 构建表内（另有 $($externallyBuilt.Count) 个按来源豁免）"
+} else {
+  foreach ($n in $missingExe) {
+    Bad "文档（$($refExes[$n])）引用了 $n.exe，但 CMakeLists.txt 没有它 ⇒ 照文档复现会卡住"
+  }
+}
+if ($badFlags.Count -eq 0) {
+  Good '文档里出现的 --flag 全部在该程序接受的表内'
+} else {
+  foreach ($k in ($badFlags.Keys | Sort-Object)) {
+    Bad "文档参数对不上：$k（该程序不接受它，或文档写错了名字）"
+  }
+}
+
 if ($script:Warn.Count) { foreach ($w in $script:Warn) { Write-Host "警告：$w" -ForegroundColor Yellow } }
 if ($script:Fail.Count) {
   Write-Host "结论：**未通过**（$($script:Fail.Count) 项失败）" -ForegroundColor Red
