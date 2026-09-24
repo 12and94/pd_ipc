@@ -140,9 +140,13 @@ int main(int argc, char** argv) {
   int steps = 600;
   int settleIters = 40;   // 稳态阶段每子步跑几次迭代（取查看器"实时档"的 40，别把稳态跑得过收敛）
   Scalar stiffness = 2305.0;
+  Scalar spacing = 0.02;
+  Scalar density = 1.0;
+  Scalar softMass = 1.0e5;  // 软 pin 的附加质量（对齐 Wang 2015 的 fixed[i]=100000）
   Scalar dt = 1.0 / 120.0;
   Scalar damping = 0.02;
-  bool pinTop = true;
+  int pinMode = 1;          // 0 = 两角（硬）；1 = 整条上边（硬）；2 = 两角（软：附加质量）
+  bool pinTop = true;       // 兼容旧写法 --pin top|corners
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -153,16 +157,27 @@ int main(int argc, char** argv) {
     else if (a == "--steps") nextInt(steps);
     else if (a == "--settle-iters") nextInt(settleIters);
     else if (a == "--stiffness") next(stiffness);
+    else if (a == "--spacing") next(spacing);
+    else if (a == "--density") next(density);
+    else if (a == "--soft-mass") next(softMass);
     else if (a == "--dt") next(dt);
     else if (a == "--damping") next(damping);
-    else if (a == "--pin" && i + 1 < argc) pinTop = (std::strcmp(argv[++i], "top") == 0);
+    else if (a == "--pin" && i + 1 < argc) {
+      const char* v = argv[++i];
+      if (std::strcmp(v, "top") == 0) { pinMode = 1; pinTop = true; }
+      else if (std::strcmp(v, "corners") == 0) { pinMode = 0; pinTop = false; }
+      else if (std::strcmp(v, "soft-corners") == 0) { pinMode = 2; pinTop = false; }
+      else { std::fprintf(stderr, "--pin 只认 top|corners|soft-corners\n"); return 2; }
+    }
     else if (a == "--help" || a == "-h") { usage(); return 0; }
   }
+  (void)pinTop;
 
   SceneConfig cfg;
   cfg.gridNx = grid;
   cfg.gridNy = grid;
-  cfg.gridSpacing = 0.02;
+  cfg.gridSpacing = spacing;
+  cfg.density = density;
   cfg.dt = dt;
   cfg.stiffness = stiffness;
   cfg.velocityDamping = damping;
@@ -176,10 +191,22 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "⚠ 本工具复算的残差只含距离约束；请用无弯曲场景（默认即无弯曲）。\n");
     return 3;
   }
-  if (pinTop) {
-    // makeScene 默认钉的是顶边两角（j = ny-1）⇒ 要先**清掉**再钉整条上边，否则会钉住两条边
+  // pin 的三种口径（为了和 Wang 2015 的代码对齐）：
+  //   hard-top      整条上边，硬固定（我们默认的诊断口径）
+  //   hard-corners  顶边两角，硬固定（我们 makeScene 的默认）
+  //   soft-corners  **他们的做法**：只钉两角，且不写 pinned，而是给该顶点**加大质量**
+  //                 （他们 `fixed[i]=100000` 进的是 c=(M[i]+fixed[i])/h²；他们还在预测里
+  //                  直接跳过这些顶点，我们让预测动一点点 g·h²/1e5 ≈ 1e-8 m/子步，可忽略）
+  if (pinMode == 1) {
     for (auto& s : ctx.mesh.pinned) s = 0;
     for (int x = 0; x < grid; ++x) ctx.mesh.pinned[static_cast<std::size_t>((grid - 1) * grid + x)] = 1;
+  } else if (pinMode == 2) {
+    // 软 pin：清掉硬标记，改用附加质量
+    const int c0 = (grid - 1) * grid + 0;
+    const int c1 = (grid - 1) * grid + (grid - 1);
+    for (auto& s : ctx.mesh.pinned) s = 0;
+    ctx.mesh.masses[static_cast<std::size_t>(c0)] += softMass;
+    ctx.mesh.masses[static_cast<std::size_t>(c1)] += softMass;
   }
   refreshPinPositions(ctx);
   ensureBuffers(ctx);
@@ -188,9 +215,12 @@ int main(int argc, char** argv) {
   for (int s = 0; s < steps; ++s) stepOnce(ctx);
   const Scalar vmax = maxSpeed(ctx);
 
+  const char* pinName = (pinMode == 1) ? "整条上边（硬）"
+                        : (pinMode == 2) ? "顶边两角（软：附加质量）"
+                                         : "顶边两角（硬）";
   std::printf("=== 单子步内的 残差-迭代 曲线（对齐 Wang 2015 Fig.9 的口径）===\n");
-  std::printf("网格 %dx%d（%d 顶点）  κ=%.6g  h=%.6g  阻尼 %.3g  pin=%s  稳态每子步 %d 次迭代\n", grid,
-              grid, grid * grid, stiffness, dt, damping, pinTop ? "整条上边" : "顶边两角", settleIters);
+  std::printf("网格 %dx%d（%d 顶点）  间距 %.4g  密度 %.4g  κ=%.6g  h=%.6g  阻尼 %.3g  pin=%s  每子步 %d 次迭代\n",
+              grid, grid, grid * grid, spacing, density, stiffness, dt, damping, pinName, settleIters);
   std::printf("先跑 %d 子步到准静态：|v|∞ = %.4g m/s（越接近 0 越接近静止）\n", steps, vmax);
 
   const Snapshot snap = take(ctx);
