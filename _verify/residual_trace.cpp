@@ -229,6 +229,24 @@ int main(int argc, char** argv) {
   restore(ctx, snap);
   const Norms n0 = residualNorms(ctx);
 
+  // ---- E1：论文口径的 r0 锚点（Wang 2015 Algorithm 1: q^(0) ← s_t，即**预测子位形**）----
+  // 在预测子位形处评 ∇E：把 positions 与 predicted 都设成 x̂ ⇒ 惯性项恒为 0，只剩弹性梯度。
+  // 注意：上面那个 r0max("预测子处")其实是在**当前位形**上算的（只换了新预测子的惯性项），
+  // 不是这个量；这里才是与论文 e(0)=∇E(s_t) 对应的锚点。
+  const std::vector<Vec3> posKeep = ctx.mesh.positions;
+  const std::vector<Vec3> predKeep = ctx.predicted;
+  for (int v = 0; v < ctx.mesh.vertexCount(); ++v) {
+    const std::size_t i = static_cast<std::size_t>(v);
+    const Vec3 xhat = posKeep[i] + ctx.mesh.velocities[i] * dt + ctx.config.gravity * (dt * dt);
+    ctx.mesh.positions[i] = xhat;
+    ctx.predicted[i] = xhat;
+  }
+  const Norms nPred = residualNorms(ctx);
+  ctx.mesh.positions = posKeep;
+  ctx.predicted = predKeep;
+  std::printf("E1 论文锚点 e0 = ∇E(预测子位形)：max %.6g / 2范数 %.6g ｜ 当前位形 r0：max %.6g / 2范数 %.6g\n",
+              nPred.maxv, nPred.l2, n0.maxv, n0.l2);
+
   // 自校验：复算的 max 必须与生产函数一致（否则本工具的 2 范数不可信）
   const Scalar prod0 = nonlinearResidual(ctx);
   const Scalar diff0 = std::fabs(n0.maxv - prod0) / std::fmax(1.0, prod0);
@@ -282,7 +300,15 @@ int main(int argc, char** argv) {
     else std::printf("  %8.0e  →  %d 次内未达到\n", thr, iters);
   }
   std::printf("（同口径的 max 范数仅供对照：max 范数会被单个最坏顶点主导，见本文件顶部说明。）\n");
-  const Scalar geo = std::pow(rl2[static_cast<std::size_t>(iters)] / rl2[1], 1.0 / (iters - 1));
+  std::printf("\n【E1】以**论文锚点** e0 = %.6g（2 范数）为分母的迭代数：\n", nPred.l2);
+  for (const Scalar thr : {1e-1, 1e-2, 1e-3, 1e-4}) {
+    int hit = -1;
+    for (int k = 1; k <= iters; ++k) {
+      if (rl2[static_cast<std::size_t>(k)] <= thr * nPred.l2) { hit = k; break; }
+    }
+    if (hit > 0) std::printf("  %8.0e  →  %3d 次\n", thr, hit);
+    else std::printf("  %8.0e  →  %d 次内未达到\n", thr, iters);
+  }  const Scalar geo = std::pow(rl2[static_cast<std::size_t>(iters)] / rl2[1], 1.0 / (iters - 1));
   std::printf("2 范数几何平均收缩因子（1…K）：%.6f  ← 论文就是用连续两次残差之比估 ρ 的\n", geo);
   return 0;
 }

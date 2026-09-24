@@ -71,6 +71,8 @@ int main(int argc, char** argv) {
   int powerIters = 400;
   int settleIters = 40;
   Scalar stiffness = 2305.0;
+  Scalar spacing = 0.02;
+  Scalar density = 1.0;
   Scalar dt = 1.0 / 120.0;
   Scalar damping = 0.02;
   bool pinTop = true;
@@ -84,6 +86,8 @@ int main(int argc, char** argv) {
     else if (a == "--iters") nextInt(powerIters);
     else if (a == "--settle-iters") nextInt(settleIters);
     else if (a == "--stiffness") next(stiffness);
+    else if (a == "--spacing") next(spacing);
+    else if (a == "--density") next(density);
     else if (a == "--dt") next(dt);
     else if (a == "--damping") next(damping);
     else if (a == "--pin" && i + 1 < argc) pinTop = (std::strcmp(argv[++i], "top") == 0);
@@ -93,7 +97,8 @@ int main(int argc, char** argv) {
   SceneConfig cfg;
   cfg.gridNx = grid;
   cfg.gridNy = grid;
-  cfg.gridSpacing = 0.02;
+  cfg.gridSpacing = spacing;
+  cfg.density = density;
   cfg.dt = dt;
   cfg.stiffness = stiffness;
   cfg.velocityDamping = damping;
