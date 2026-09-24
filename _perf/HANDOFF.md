@@ -130,6 +130,11 @@ cd D:\dsh_workspace\pd_ipc
   （只重采扫描 + 四套约束集，不动 §八/§九/§十一 的 A/B 面板）；看板**每节标题下印"采集时间"**
   并加了"组内可比、组间不可比"的口径句，`check_report.js` 把它纳入自检。
   **默认约束集物理输出不变**（与 `pd_bench_pre_fuse.exe` 逐字比对通过）。
+  同一轮的后续（提交 `fc4cb4c` 与之后）：**测量脚本与看板脚本迁进 `_perf/` 纳入版本控制**（产物仍在
+  `build/` 下）、新增 **`tools/check.ps1`**（一条命令跑完验收集 + 编码门禁 + 文档数字对账 + 物理基线
+  逐字比对 + 看板自检），并新增诊断工具 **`pd_sharefactor`**（`_verify/share_factor.cpp`）实测
+  "三分量因子只存一份 vs 各存一份"：**200×200 冷档 −39…−43.5 %、100×100 −13…−32 %、
+  40×40 只有 −3…−5 %**（详见 `docs/perf.md` §16）——**只测量，未做生产改造**。
 
 **测量与看板工具**（2026-09-24 起**已纳入版本控制**，在仓库根的 `_perf/` 下 —— 与 `_verify/` 对称）：
 性能看板 `build/_perf/perf-report.html`（**产物，仍在 gitignore 的 build/ 下**；`node _perf/make_report.js`
@@ -313,8 +318,11 @@ ab_bend_variants, ab_inertial, constraint_sets, refresh_report}.ps1`（**都必�
 - `docs/solver-feasibility.md` —— 求解器可行性的全部实测数据与"为什么不做并行回代"。
 - `docs/parallel-refactor.md` —— 并行改造方案与 Phase 0/1/2/3/4a/4b 阶段表（含每阶段验收）。
 - 工具：`_verify/solve_audit.cpp`（`pd_solveaudit`：求解器审计 + 层调度并行原型）；
+  `_verify/solve_components.cpp`（`pd_solvecomp`：三分量拆分的结构自检 + 逐位比对 + 微基准）；
+  `_verify/share_factor.cpp`（`pd_sharefactor`：因子"只存一份 vs 各存一份"的冷/热两档实测，见 `docs/perf.md` §16）；
   `_verify/bend_audit.cpp`（`pd_bendaudit`：弯曲约束的代数审计）；
-  `_perf/{make_report.js, check_report.js, serve.js, ab_residual.ps1, ab_solve.ps1, ab_bend.ps1}`。
+  `_verify/` 与 `tools/` 下的其它诊断；`_perf/{make_report.js, check_report.js, serve.js, refresh_report.ps1,
+  ab_*.ps1, constraint_sets.ps1}`（测量脚本与看板脚本在 `_perf/`，**已纳入版本控制**）。
 
 ## 7. 已知的坑（前人踩过、排查很贵）
 
@@ -429,8 +437,11 @@ ab_bend_variants, ab_inertial, constraint_sets, refresh_report}.ps1`（**都必�
   （判据 = 0.3·|g| = 2.943 m/s²，400 次后仍停在 5.7，每次迭代只降 ~0.3%），所以瞬态的迭代数是
   硬截断。实测 40 → 20 次迭代 = 总时间 **−49%**，而弹性能只差 0.5%。
   注意 Phase 4c 之后单次迭代便宜了很多，但"少几次迭代"仍是线性收益。
-- **回代剩余的方向**：Phase 4c 已把"一个 solve"拆成 3 条独立链（2.0–2.8×）。还想再要的话，
-  下一个候选是**分块流水**（把因子按消去树切两段：L₁₁ 解完 → 用 GEMM 更新右端（可并行）→ L₂₂），
+- **回代剩余的方向**：Phase 4c 已把"一个 solve"拆成 3 条独立链（2.0–2.8×）。**下一项已实测、待拍板**：
+  **因子只存一份**（三块同构同值，现在各存一份）—— 并行冷档 40×40 −3…−5 %、100×100 −13…−32 %、
+  **200×200 −39…−43.5 %**（那一档回代占单子步 74 % ⇒ 单子步约 −29…−33 %），且**逐位不变**能保住；
+  但**主工况 40×40 上不够格**，所以是否实施取决于目标规模（`docs/perf.md` §16，工具 `pd_sharefactor`）。
+  另一个候选是**分块流水**（把因子按消去树切两段：L₁₁ 解完 → 用 GEMM 更新右端（可并行）→ L₂₂），
   但收益未知、且会改变求和顺序（那就**不再逐位不变**，要重做物理基线）。
   三角求解**内部**的并行（层调度）已经被量过两次，不要再试一次 —— 见 `docs/solver-feasibility.md` §3。
 - **M2 判据口径**：`docs/plan.md` M2 写的"8 线程局部步 ≥5×（N ≥ 40k）"实测只有 2.36×，

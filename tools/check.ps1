@@ -8,7 +8,9 @@
 #   ② 数字权威化：把每个程序**自报的计数**抽出来，再与文档里"当前计数"的口径句逐处比对；
 #   ③ 编码门禁：所有跟踪的 *.ps1 必须带 UTF-8 BOM；所有跟踪文本必须 UTF-8 无 BOM + LF；
 #   ④ 结构性回归：默认约束集的物理输出必须与存档基线 pd_bench_pre_fuse.exe **逐字相同**；
-#      看板 HTML 存在时再跑一遍 _perf/check_report.js（DOM 桩真跑渲染 + 关键数字反查）。
+#      看板 HTML 存在时再跑一遍 _perf/check_report.js（DOM 桩真跑渲染 + 关键数字反查）；
+#   ⑥ 另外反查两条"结构性前提"（pd_solvecomp / pd_sharefactor）：⊗ 结构不被破坏、
+#      三分量因子切片同构且逐位相同、单份求解 == 各份求解。
 #
 # 用法： .\tools\check.ps1                 # 全部（约 10 秒，不含 A/B 测量）
 #        .\tools\check.ps1 -NoPhysics      # 跳过物理基线比对（存档二进制不在时）
@@ -152,6 +154,17 @@ if ($runs['pd_solvecomp']) {
   else { Bad 'pd_solvecomp：跨分量填充不为 0（⊗ 结构被破坏 ⇒ 三分量并行会静默退化）' }
   if ($o -match '最大逐元素差 0\.000e\+00') { Good 'pd_solvecomp：三分量拆 vs 整趟 逐位相同' }
   else { Bad 'pd_solvecomp：三分量拆与整趟不再逐位相同' }
+}
+
+# 因子"三份完全一致"这条前提：只有 pd_sharefactor 在查（它是"只存一份"与任何"共用因子"优化的前提）。
+# 这里只跑 40×40 / reps 1 / 不测冷档 —— 只取断言，不取时间（时间在 docs/perf.md §16 里另记）。
+$sf = RunExe 'pd_sharefactor' @('--grid', '40', '40', '--reps', '1', '--flush-mb', '0')
+if ($sf) {
+  if ($sf.Code -ne 0) { Bad "pd_sharefactor exit=$($sf.Code)（前提自检或逐位比对不通过）" }
+  elseif ($sf.Out -match '不一致的列 = 0；对角 1/D 不一致 = 0') { Good 'pd_sharefactor：三分量因子切片同构且数值逐位相同' }
+  else { Bad 'pd_sharefactor：三分量切片的"同构 + 逐位相同"前提不成立' }
+  if ($sf.Out -match '最大逐元素差 0\.000e\+00') { Good 'pd_sharefactor：单份求解 == 各份求解（逐位）' }
+  else { Bad 'pd_sharefactor：单份求解与各份求解不再逐位相同' }
 }
 
 # ---------------------------------------------------------------- ③ 编码门禁
