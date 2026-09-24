@@ -428,6 +428,191 @@ bool scalarFactorNnz(const SpMat& L, long long& outNnz, int& outN) {
   return true;
 }
 
+/// 紧凑单份的**参数化行号版本**：用于比较"行号用 4 字节 int"与"用 2 字节 uint16"（任务 C① 的后续）。
+/// 只在 m ≤ 65535 时 uint16 才装得下（本项目 200×200 的 m = 40000、300×300 的 m = 90000 就装不下了）。
+template <typename IdxT>
+struct CompactIdx {
+  int m = 0;
+  std::vector<int> ptr;
+  std::vector<IdxT> rowRel;
+  std::vector<double> val;
+  std::vector<double> dinv;
+  long long nnz = 0;
+  int mismatchedColumns = 0;
+  int mismatchedDiag = 0;
+  double buildMs = 0.0;
+};
+
+template <typename IdxT>
+CompactIdx<IdxT> buildCompactIdx(const FactorSet& fs) {
+  CompactIdx<IdxT> cf;
+  const auto t0 = Clock::now();
+  cf.m = fs.n / kComponents;
+  cf.ptr.assign(static_cast<std::size_t>(cf.m) + 1, 0);
+  const SpMat& F = *fs.F;
+  const std::vector<int>& ref = fs.asc[0];
+  for (int k = 0; k < cf.m; ++k) {
+    cf.ptr[static_cast<std::size_t>(k)] = static_cast<int>(cf.nnz);
+    for (SpMat::InnerIterator it(F, ref[static_cast<std::size_t>(k)]); it; ++it) {
+      cf.rowRel.push_back(static_cast<IdxT>(fs.rankInComp[static_cast<std::size_t>(it.row())]));
+      cf.val.push_back(it.value());
+      cf.nnz += 1;
+    }
+    cf.dinv.push_back(fs.dinv[ref[static_cast<std::size_t>(k)]]);
+  }
+  cf.ptr[static_cast<std::size_t>(cf.m)] = static_cast<int>(cf.nnz);
+  cf.buildMs = secondsSince(t0) * 1e3;
+  for (int c = 1; c < kComponents; ++c) {
+    for (int k = 0; k < cf.m; ++k) {
+      const int j = fs.asc[static_cast<std::size_t>(c)][static_cast<std::size_t>(k)];
+      int e = cf.ptr[static_cast<std::size_t>(k)];
+      bool bad = false;
+      for (SpMat::InnerIterator it(F, j); it; ++it) {
+        if (e >= cf.ptr[static_cast<std::size_t>(k) + 1]) { bad = true; break; }
+        const int rel = fs.rankInComp[static_cast<std::size_t>(it.row())];
+        if (rel != static_cast<int>(cf.rowRel[static_cast<std::size_t>(e)]) ||
+            !bitwiseEqual(it.value(), cf.val[static_cast<std::size_t>(e)])) {
+          bad = true;
+          break;
+        }
+        ++e;
+      }
+      if (bad || e != cf.ptr[static_cast<std::size_t>(k) + 1]) cf.mismatchedColumns += 1;
+      if (!bitwiseEqual(fs.dinv[j], cf.dinv[static_cast<std::size_t>(k)])) cf.mismatchedDiag += 1;
+    }
+  }
+  return cf;
+}
+
+template <typename IdxT>
+inline void solveSharedSliceIdx(const FactorSet& fs, const CompactIdx<IdxT>& cf, int c, double* w,
+                                const double* b, double* x) {
+  const int* o = fs.origOfPerm.data();
+  const std::vector<int>& ac = fs.asc[static_cast<std::size_t>(c)];
+  const int m = cf.m;
+  for (int k = 0; k < m; ++k) w[ac[static_cast<std::size_t>(k)]] = b[o[ac[static_cast<std::size_t>(k)]]];
+  for (int k = 0; k < m; ++k) {
+    const int j = ac[static_cast<std::size_t>(k)];
+    const double yj = w[j];
+    for (int e = cf.ptr[static_cast<std::size_t>(k)]; e < cf.ptr[static_cast<std::size_t>(k) + 1]; ++e) {
+      const int rel = static_cast<int>(cf.rowRel[static_cast<std::size_t>(e)]);
+      if (rel > k) w[ac[static_cast<std::size_t>(rel)]] -= cf.val[static_cast<std::size_t>(e)] * yj;
+    }
+  }
+  for (int k = 0; k < m; ++k) {
+    w[ac[static_cast<std::size_t>(k)]] *= cf.dinv[static_cast<std::size_t>(k)];
+  }
+  for (int k = m - 1; k >= 0; --k) {
+    const int j = ac[static_cast<std::size_t>(k)];
+    double s = w[j];
+    for (int e = cf.ptr[static_cast<std::size_t>(k)]; e < cf.ptr[static_cast<std::size_t>(k) + 1]; ++e) {
+      const int rel = static_cast<int>(cf.rowRel[static_cast<std::size_t>(e)]);
+      if (rel > k) s -= cf.val[static_cast<std::size_t>(e)] * w[ac[static_cast<std::size_t>(rel)]];
+    }
+    w[j] = s;
+  }
+  for (int k = 0; k < m; ++k) x[o[ac[static_cast<std::size_t>(k)]]] = w[ac[static_cast<std::size_t>(k)]];
+}
+
+/// 行号宽度对照：紧凑单份的行号用 4 字节 int vs 2 字节 uint16（每条目 12 B → 10 B，−17 % 字节）。
+/// 只在 m ≤ 65535 时有意义（生产实现必须按 m 选宽度；本项目 200×200 的 m = 40000 ✓、300×300 = 90000 ✗）。
+struct BenchIdx {
+  double i32HotP = 0, i16HotP = 0;
+  double i32ColdP = 0, i16ColdP = 0;
+  double i32Cold = 0, i16Cold = 0;
+};
+
+BenchIdx runBenchIdx(const FactorSet& fs, const CompactIdx<int>& c32, const CompactIdx<unsigned short>& c16,
+                     const std::vector<double>& b, std::vector<double>& x, int reps, int threads,
+                     std::vector<unsigned char>& flushBuf) {
+  BenchIdx r;
+  std::vector<double> w(static_cast<std::size_t>(fs.n), 0.0);
+  const double inf = 1e30;
+  r.i32HotP = r.i16HotP = r.i32ColdP = r.i16ColdP = r.i32Cold = r.i16Cold = inf;
+
+  // 1 线程 + 冷数据（区域外；必须排在任何多线程区域之前）
+  for (int i = 0; i < reps; ++i) {
+    if (!flushBuf.empty()) flushCache(flushBuf);
+    {
+      const auto t0 = Clock::now();
+      for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c32, c, w.data(), b.data(), x.data());
+      r.i32Cold = std::min(r.i32Cold, secondsSince(t0) * 1e3);
+    }
+    if (!flushBuf.empty()) flushCache(flushBuf);
+    {
+      const auto t0 = Clock::now();
+      for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c16, c, w.data(), b.data(), x.data());
+      r.i16Cold = std::min(r.i16Cold, secondsSince(t0) * 1e3);
+    }
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+  {
+#ifdef _OPENMP
+    const int tid = omp_get_thread_num();
+#else
+    const int tid = 0;
+#endif
+    for (int rep = 0; rep < reps; ++rep) {
+      {
+        const auto t0 = Clock::now();
+#ifdef _OPENMP
+#pragma omp for schedule(static, 1)
+#endif
+        for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c32, c, w.data(), b.data(), x.data());
+        const double t = secondsSince(t0) * 1e3;
+        if (tid == 0) r.i32HotP = std::min(r.i32HotP, t);
+      }
+      {
+        const auto t0 = Clock::now();
+#ifdef _OPENMP
+#pragma omp for schedule(static, 1)
+#endif
+        for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c16, c, w.data(), b.data(), x.data());
+        const double t = secondsSince(t0) * 1e3;
+        if (tid == 0) r.i16HotP = std::min(r.i16HotP, t);
+      }
+      if (!flushBuf.empty()) {
+#ifdef _OPENMP
+#pragma omp master
+#endif
+        flushCache(flushBuf);
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+        {
+          const auto t0 = Clock::now();
+#ifdef _OPENMP
+#pragma omp for schedule(static, 1)
+#endif
+          for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c32, c, w.data(), b.data(), x.data());
+          const double t = secondsSince(t0) * 1e3;
+          if (tid == 0) r.i32ColdP = std::min(r.i32ColdP, t);
+        }
+#ifdef _OPENMP
+#pragma omp master
+#endif
+        flushCache(flushBuf);
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+        {
+          const auto t0 = Clock::now();
+#ifdef _OPENMP
+#pragma omp for schedule(static, 1)
+#endif
+          for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c16, c, w.data(), b.data(), x.data());
+          const double t = secondsSince(t0) * 1e3;
+          if (tid == 0) r.i16ColdP = std::min(r.i16ColdP, t);
+        }
+      }
+    }
+  }
+  return r;
+}
+
 void printUsage() {
   std::printf(
       "用法：pd_sharefactor [--grid N M] [--stiffness K] [--reps R] [--threads T] [--flush-mb F]\n"
@@ -592,6 +777,50 @@ int main(int argc, char** argv) {
                                          : "**复制排序并不更省（联合图上的 AMD 已经更好或持平）⇒ 此路不通**");
     } else {
       std::printf("  抽不出单条链的标量图（矩阵不是 Ã ⊗ I₃）—— 跳过。\n");
+    }
+  }
+
+  // ---- ⑥ 行号宽度：4 字节 int vs 2 字节 uint16 ----
+  // 因子读的字节数 = nnz ×(值 8 B + 行号 4 B)。行号能用 uint16 就省 2 B/项 ⇒ −17 % 字节。
+  // 只在 m ≤ 65535 时可行（生产实现必须按 m 选宽度，装不下就退回 32 位）。
+  {
+    std::printf("\n--- ⑥ 行号宽度：紧凑单份的行号用 4 字节 int vs 2 字节 uint16 ---\n");
+    const int m = fs.n / kComponents;
+    if (m > 65535) {
+      std::printf("  m = %d > 65535 ⇒ uint16 装不下，本档跳过（生产实现必须按 m 选宽度）。\n", m);
+    } else {
+      const CompactIdx<int> c32 = buildCompactIdx<int>(fs);
+      const CompactIdx<unsigned short> c16 = buildCompactIdx<unsigned short>(fs);
+      const double b32 = static_cast<double>(c32.nnz) * 12.0;
+      const double b16 = static_cast<double>(c16.nnz) * 10.0;
+      std::printf("  每分量 nnz %lld；每条目 12 B（int） vs 10 B（uint16）⇒ 字节 **−%.1f %%**\n", c32.nnz,
+                  100.0 * (b32 - b16) / b32);
+      std::printf("  构建：int %.3f ms / uint16 %.3f ms；自检不一致列 %d / %d\n", c32.buildMs, c16.buildMs,
+                  c16.mismatchedColumns, c16.mismatchedDiag);
+
+      // 正确性：两条路径必须逐位相同（行号宽度只影响索引，不参与算术）
+      std::vector<double> y32(static_cast<std::size_t>(fs.n), 0.0);
+      std::vector<double> y16(static_cast<std::size_t>(fs.n), 0.0);
+      std::vector<double> w2(static_cast<std::size_t>(fs.n), 0.0);
+      for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c32, c, w2.data(), b.data(), y32.data());
+      for (int c = 0; c < kComponents; ++c) solveSharedSliceIdx(fs, c16, c, w2.data(), b.data(), y16.data());
+      const bool same = std::memcmp(y32.data(), y16.data(), sizeof(double) * static_cast<std::size_t>(fs.n)) == 0;
+      std::printf("  正确性：uint16 与 int 两条路径的解 ⇒ %s\n",
+                  same ? "**逐位相同**（行号宽度不参与算术）" : "**不同，需查**");
+
+      const BenchIdx ri = runBenchIdx(fs, c32, c16, b, y16, reps, threads, flushBuf);
+      const auto grow = [](const char* label, double a, double bb) {
+        std::printf("    %-22s %9.4f %9.4f   %5.3fx  （%+.1f %%）\n", label, a, bb, bb / a,
+                    100.0 * (bb / a - 1.0));
+      };
+      std::printf("                            int(4B)   uint16(2B)   uint16/int\n");
+      grow("并行 · 热数据", ri.i32HotP, ri.i16HotP);
+      grow("并行 · 冷数据", ri.i32ColdP, ri.i16ColdP);
+      grow("1 线程 · 冷数据", ri.i32Cold, ri.i16Cold);
+      const double gain = 100.0 * (ri.i32ColdP - ri.i16ColdP) / ri.i32ColdP;
+      std::printf("  ⇒ 并行冷档（生产形状）uint16 快 **%.1f %%** ⇒ %s\n", gain,
+                  gain > 5.0 ? "**值得做进生产**（按 m 选宽度，m > 65535 时退回 32 位）"
+                             : "**在噪声内（<5 %）⇒ 不做**（多一套索引宽度不划算）");
     }
   }
 
